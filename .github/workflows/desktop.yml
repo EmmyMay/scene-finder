@@ -1,0 +1,69 @@
+name: Desktop builds
+on:
+  pull_request:
+  push:
+    branches: [master]
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-15, windows-2022, ubuntu-22.04]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - name: macOS build tools
+        if: runner.os == 'macOS'
+        run: brew install pkgconf nasm
+      - name: Linux build tools
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y build-essential pkg-config nasm curl xz-utils
+      - name: Windows build tools
+        if: runner.os == 'Windows'
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            curl
+            tar
+            xz
+            diffutils
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-pkgconf
+            mingw-w64-x86_64-nasm
+      - name: Build media tools (macOS/Linux)
+        if: runner.os != 'Windows'
+        run: npm run media:prepare
+      - name: Build media tools (Windows)
+        if: runner.os == 'Windows'
+        shell: msys2 {0}
+        run: bash scripts/prepare-media.sh
+      - name: Add media tools to PATH
+        shell: bash
+        run: echo "$GITHUB_WORKSPACE/.data/media" >> "$GITHUB_PATH"
+      - name: Verify native media (macOS/Linux)
+        if: runner.os != 'Windows'
+        run: node scripts/check-media.mjs
+      - name: Verify native media (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: PATH="/c/msys64/mingw64/bin:$PATH" node scripts/check-media.mjs
+      - run: npm run typecheck
+      - run: npm test
+      - run: npm run package:desktop
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Scene-Finder-${{ runner.os }}-${{ runner.arch }}
+          path: release/
+          retention-days: 14
