@@ -8,6 +8,7 @@ import {
   buildSystemOneWindowRequest,
   chooseSampleStepSeconds,
   createTypeSafeJevScorer,
+  extractSampledFrames,
   groupFramesIntoScenes,
   probeVideoFile,
   startServer,
@@ -747,16 +748,22 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     await limitedServer.close();
     activeServers.pop();
 
-    // 2. Test slow ffprobe upload gets killed and close() completes promptly
+    // 2. Test slow ffprobe upload gets killed and close() completes promptly (portable across Windows/macOS/Linux)
     const slowBinDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-slow-bin-"));
     tempDirs.push(slowBinDir);
     const markerFile = path.join(slowBinDir, "started.txt");
-    const slowFfprobePath = path.join(slowBinDir, "slow-ffprobe.sh");
+    const slowFfprobePath = path.join(slowBinDir, "slow-ffprobe.mjs");
 
     await fsp.writeFile(
       slowFfprobePath,
-      `#!/bin/sh\nif [ "$1" = "-version" ]; then\n  exit 0\nfi\necho "$$" > "${markerFile}"\nsleep 30\n`,
-      { mode: 0o755 }
+      `import fs from "node:fs";
+if (process.argv[2] === "-version") {
+  process.exit(0);
+}
+fs.writeFileSync(${JSON.stringify(markerFile)}, String(process.pid));
+setTimeout(() => {}, 30000);
+`,
+      "utf8"
     );
 
     const slowServer = await startServer({
@@ -775,7 +782,7 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
       body: slowForm
     }).catch(() => null);
 
-    // Wait for slow-ffprobe.sh to start
+    // Wait for slow-ffprobe.mjs to start
     const waitDeadline = Date.now() + 5000;
     while (!fs.existsSync(markerFile) && Date.now() < waitDeadline) {
       await new Promise((r) => setTimeout(r, 25));
@@ -925,21 +932,25 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     const wrapperDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-ffmpeg-wrap-"));
     tempDirs.push(wrapperDir);
     const extractStartedFile = path.join(wrapperDir, "extract-started.txt");
-    const slowFfmpegPath = path.join(wrapperDir, "slow-extract-ffmpeg.sh");
+    const slowFfmpegPath = path.join(wrapperDir, "slow-extract-ffmpeg.mjs");
 
-    // Delay only frame extraction invocations (which contain showinfo in args) by 0.6s so both searches attach to the in-flight extraction
+    // Portable Node wrapper that delays frame extraction invocations (containing showinfo) by 600ms
     await fsp.writeFile(
       slowFfmpegPath,
-      `#!/bin/sh
-case "$*" in
-  *showinfo*)
-    echo "started" > "${extractStartedFile}"
-    sleep 0.6
-    ;;
-esac
-exec ffmpeg "$@"
+      `import { spawn } from "node:child_process";
+import fs from "node:fs";
+
+const args = process.argv.slice(2);
+if (args.some((arg) => arg.includes("showinfo"))) {
+  fs.writeFileSync(${JSON.stringify(extractStartedFile)}, "started");
+  await new Promise((r) => setTimeout(r, 600));
+}
+
+const child = spawn("ffmpeg", args, { stdio: "inherit" });
+child.on("error", () => process.exit(1));
+child.on("exit", (code) => process.exit(code ?? 1));
 `,
-      { mode: 0o755 }
+      "utf8"
     );
 
     const server = await startServer({
@@ -1022,5 +1033,108 @@ exec ffmpeg "$@"
     expect(closeElapsedMs).toBeLessThan(2000);
     await clipRes.body?.cancel().catch(() => undefined);
   });
+
+  it("repairs damaged frame cache directories when a cached JPEG is missing and enforces both estimated and actual frame budgets", async () => {
+    const cacheDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-cache-repair-"));
+    tempDirs.push(cacheDir);
+    const framesOutDir = path.join(cacheDir, "frames_step_1");
+
+    // 1. Initial extraction creates manifest.json + frame JPEGs
+    const firstFrames = await extractSampledFrames({
+      moviePath: syntheticMoviePath,
+      outputDir: framesOutDir,
+      sampleStepSeconds: 1,
+      width: 320,
+      height: 240,
+      durationSeconds: 12
+    });
+    expect(firstFrames.length).toBeGreaterThanOrEqual(10);
+    const deletedFramePath = firstFrames[1].filePath;
+    expect(fs.existsSync(deletedFramePath)).toBe(true);
+
+    // Delete a single cached JPEG while leaving manifest.json intact
+    await fsp.unlink(deletedFramePath);
+    expect(fs.existsSync(deletedFramePath)).toBe(false);
+    expect(fs.existsSync(path.join(framesOutDir, "manifest.json"))).toBe(true);
+
+    // Re-extracting must replace the damaged cache directory so all returned frame paths exist on disk
+    const repairedFrames = await extractSampledFrames({
+      moviePath: syntheticMoviePath,
+      outputDir: framesOutDir,
+      sampleStepSeconds: 1,
+      width: 320,
+      height: 240,
+      durationSeconds: 12
+    });
+    expect(repairedFrames.length).toBe(firstFrames.length);
+    for (const frame of repairedFrames) {
+      expect(fs.existsSync(frame.filePath)).toBe(true);
+    }
+
+    // 2. Estimated frame budget: 0.05s sampling on a 2-hour movie (144,001 frames) is rejected before extraction
+    expect(() => chooseSampleStepSeconds(7200, 0.05)).toThrow(/budget/i);
+
+    await expect(
+      extractSampledFrames({
+        moviePath: syntheticMoviePath,
+        outputDir: path.join(cacheDir, "over-estimated"),
+        sampleStepSeconds: 0.05,
+        width: 320,
+        height: 240,
+        durationSeconds: 7200
+      })
+    ).rejects.toMatchObject({
+      code: "FRAME_BUDGET_EXCEEDED"
+    });
+
+    // 3. Actual frame budget: even if durationSeconds metadata is missing/under-reported (0.5s), actual extracted frames > maxFrames is rejected
+    await expect(
+      extractSampledFrames({
+        moviePath: syntheticMoviePath,
+        outputDir: path.join(cacheDir, "over-actual"),
+        sampleStepSeconds: 1,
+        width: 320,
+        height: 240,
+        durationSeconds: 0.5,
+        maxFrames: 4
+      })
+    ).rejects.toMatchObject({
+      code: "FRAME_BUDGET_EXCEEDED"
+    });
+
+    // 4. HTTP search endpoint returns 400 FRAME_BUDGET_EXCEEDED when requested step exceeds budget
+    const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-budget-http-"));
+    tempDirs.push(dataDir);
+    const server = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      dataDir,
+      maxSampledFrames: 20
+    });
+    activeServers.push(server);
+
+    const fileBytes = await fsp.readFile(syntheticMoviePath);
+    const formData = new FormData();
+    formData.append("file", new Blob([fileBytes], { type: "video/mp4" }), "clip.mp4");
+    const uploadRes = await fetch(`${server.url}/api/movies`, {
+      method: "POST",
+      body: formData
+    });
+    const { movie } = (await uploadRes.json()) as { movie: { id: string } };
+
+    // 12s movie at 0.05s step estimates 241 frames > maxSampledFrames (20)
+    const budgetRes = await fetch(`${server.url}/api/movies/${movie.id}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        query: "red scene",
+        sampleStepSeconds: 0.05
+      })
+    });
+    expect(budgetRes.status).toBe(400);
+    const budgetBody = (await budgetRes.json()) as { error: { code: string } };
+    expect(budgetBody.error.code).toBe("FRAME_BUDGET_EXCEEDED");
+  });
 });
+
 

@@ -50,6 +50,19 @@ export async function moveFileCrossDevice(sourcePath: string, targetPath: string
   }
 }
 
+function resolveBinaryInvocation(
+  command: string,
+  args: string[]
+): { file: string; args: string[] } {
+  if (/\.(?:[cm]?js)$/i.test(command)) {
+    return {
+      file: process.execPath,
+      args: [command, ...args]
+    };
+  }
+  return { file: command, args };
+}
+
 export async function checkBinaryAvailable(binary: string): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     let settled = false;
@@ -60,9 +73,10 @@ export async function checkBinaryAvailable(binary: string): Promise<boolean> {
       }
     };
 
+    const resolved = resolveBinaryInvocation(binary, ["-version"]);
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(binary, ["-version"], {
+      child = spawn(resolved.file, resolved.args, {
         stdio: ["ignore", "ignore", "ignore"],
         detached: process.platform !== "win32"
       });
@@ -100,10 +114,11 @@ function runProcess(
       return;
     }
 
+    const resolved = resolveBinaryInvocation(command, args);
     let settled = false;
     let child: ReturnType<typeof spawn>;
     try {
-      child = spawn(command, args, {
+      child = spawn(resolved.file, resolved.args, {
         stdio: ["ignore", "pipe", "pipe"],
         detached: process.platform !== "win32"
       });
@@ -545,14 +560,26 @@ export function computeTargetFrameDimensions(
   return { width: w, height: h };
 }
 
+export const DEFAULT_MAX_SAMPLED_FRAMES = 4000;
+
+function normalizeMaxSampledFrames(maxSampledFrames?: number): number {
+  const parsed = Number(maxSampledFrames ?? process.env.MAX_SAMPLED_FRAMES ?? DEFAULT_MAX_SAMPLED_FRAMES);
+  return Number.isFinite(parsed) && parsed >= 1 ? Math.floor(parsed) : DEFAULT_MAX_SAMPLED_FRAMES;
+}
+
 /**
- * Selects a candid, consistent sampling interval (0.5s for <=2s clips, 1s for <=120s, 2s for longer movies)
- * and validates any caller-supplied `requestedStepSeconds` is finite and has a positive minimum after rounding.
+ * Selects a candid, consistent sampling interval (0.5s for <=2s clips, 1s for <=15s, 2s for longer movies),
+ * validates any caller-supplied `requestedStepSeconds` is finite and >= 0.05s after rounding,
+ * and enforces the estimated frame budget (`maxSampledFrames`).
  */
 export function chooseSampleStepSeconds(
   durationSeconds: number,
-  requestedStepSeconds?: unknown
+  requestedStepSeconds?: unknown,
+  maxSampledFrames?: number
 ): number {
+  const maxFrames = normalizeMaxSampledFrames(maxSampledFrames);
+  let chosenStep: number;
+
   if (requestedStepSeconds !== undefined) {
     if (
       typeof requestedStepSeconds !== "number" ||
@@ -573,16 +600,27 @@ export function chooseSampleStepSeconds(
         400
       );
     }
-    return rounded;
+    chosenStep = rounded;
+  } else if (durationSeconds <= 2) {
+    chosenStep = 0.5;
+  } else if (durationSeconds <= 15) {
+    chosenStep = 1;
+  } else {
+    chosenStep = 2;
   }
 
-  if (durationSeconds <= 2) {
-    return 0.5;
+  if (Number.isFinite(durationSeconds) && durationSeconds > 0) {
+    const estimatedFrames = Math.floor(durationSeconds / chosenStep) + 1;
+    if (estimatedFrames > maxFrames) {
+      throw new AppError(
+        "FRAME_BUDGET_EXCEEDED",
+        `Estimated frame count (${estimatedFrames}) for a ${roundTimestamp(durationSeconds)}s video at ${chosenStep}s sampling exceeds the maximum frame budget (${maxFrames}). Increase sampleStepSeconds or trim the video.`,
+        400
+      );
+    }
   }
-  if (durationSeconds <= 15) {
-    return 1;
-  }
-  return 2;
+
+  return chosenStep;
 }
 
 export function parseShowinfoTimestamps(stderr: string): Map<number, number> {
@@ -607,6 +645,8 @@ export interface ExtractFramesOptions {
   sampleStepSeconds: number;
   width: number;
   height: number;
+  durationSeconds?: number;
+  maxFrames?: number;
   ffmpegBin?: string;
   signal?: AbortSignal;
 }
@@ -621,19 +661,50 @@ interface CachedFramesManifest {
   }>;
 }
 
+async function replaceDirectory(sourceDir: string, targetDir: string): Promise<void> {
+  await fsp.mkdir(path.dirname(targetDir), { recursive: true });
+  await fsp.rm(targetDir, { recursive: true, force: true }).catch(() => undefined);
+  try {
+    await fsp.rename(sourceDir, targetDir);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "EXDEV" || code === "EPERM" || code === "EACCES") {
+      await fsp.cp(sourceDir, targetDir, { recursive: true });
+      await fsp.rm(sourceDir, { recursive: true, force: true }).catch(() => undefined);
+      return;
+    }
+    throw err;
+  }
+}
+
 export async function extractSampledFrames(
   options: ExtractFramesOptions
 ): Promise<ExtractedFrame[]> {
+  const maxFrames = normalizeMaxSampledFrames(options.maxFrames);
+  const validatedStep = chooseSampleStepSeconds(
+    options.durationSeconds ?? 0,
+    options.sampleStepSeconds,
+    maxFrames
+  );
+
   const manifestPath = path.join(options.outputDir, "manifest.json");
   if (fs.existsSync(manifestPath)) {
+    let cachedFrames: ExtractedFrame[] | null = null;
     try {
       const raw = await fsp.readFile(manifestPath, "utf8");
       const parsed = JSON.parse(raw) as CachedFramesManifest;
       if (
-        parsed.sampleStepSeconds === options.sampleStepSeconds &&
+        parsed.sampleStepSeconds === validatedStep &&
         Array.isArray(parsed.frames) &&
         parsed.frames.length > 0
       ) {
+        if (parsed.frames.length > maxFrames) {
+          throw new AppError(
+            "FRAME_BUDGET_EXCEEDED",
+            `Cached frame count (${parsed.frames.length}) exceeds the maximum frame budget (${maxFrames}).`,
+            400
+          );
+        }
         const resolved: ExtractedFrame[] = [];
         let allExist = true;
         for (const item of parsed.frames) {
@@ -651,11 +722,17 @@ export async function extractSampledFrames(
           });
         }
         if (allExist) {
-          return resolved;
+          cachedFrames = resolved;
         }
       }
-    } catch {
+    } catch (err) {
+      if (err instanceof AppError) {
+        throw err;
+      }
       // Re-extract if cache manifest is unreadable
+    }
+    if (cachedFrames) {
+      return cachedFrames;
     }
   }
 
@@ -664,7 +741,7 @@ export async function extractSampledFrames(
 
   try {
     const targetDims = computeTargetFrameDimensions(options.width, options.height);
-    const stepExpr = Number(options.sampleStepSeconds.toFixed(4));
+    const stepExpr = Number(validatedStep.toFixed(4));
     const filterChain = [
       `select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,${stepExpr})'`,
       "showinfo",
@@ -686,6 +763,8 @@ export async function extractSampledFrames(
         filterChain,
         "-fps_mode",
         "vfr",
+        "-frames:v",
+        String(maxFrames + 1),
         "-start_number",
         "0",
         "-q:v",
@@ -711,6 +790,14 @@ export async function extractSampledFrames(
       .filter((item) => item.index >= 0)
       .sort((a, b) => a.index - b.index);
 
+    if (files.length > maxFrames) {
+      throw new AppError(
+        "FRAME_BUDGET_EXCEEDED",
+        `Extracted frame count (${files.length}) exceeds the maximum frame budget (${maxFrames}). Increase sampleStepSeconds or trim the video.`,
+        400
+      );
+    }
+
     const manifestFrames: CachedFramesManifest["frames"] = [];
     for (const item of files) {
       const measuredTime = measuredTimestamps.get(item.index);
@@ -730,7 +817,7 @@ export async function extractSampledFrames(
     }
 
     const manifest: CachedFramesManifest = {
-      sampleStepSeconds: options.sampleStepSeconds,
+      sampleStepSeconds: validatedStep,
       frames: manifestFrames
     };
     await fsp.writeFile(
@@ -739,13 +826,7 @@ export async function extractSampledFrames(
       "utf8"
     );
 
-    await fsp.mkdir(path.dirname(options.outputDir), { recursive: true });
-    if (!fs.existsSync(manifestPath)) {
-      await fsp.rm(options.outputDir, { recursive: true, force: true }).catch(() => undefined);
-      await moveFileCrossDevice(tempExtractDir, options.outputDir);
-    } else {
-      await fsp.rm(tempExtractDir, { recursive: true, force: true }).catch(() => undefined);
-    }
+    await replaceDirectory(tempExtractDir, options.outputDir);
 
     return manifestFrames.map((item) => ({
       ...item,
@@ -756,3 +837,4 @@ export async function extractSampledFrames(
     throw err;
   }
 }
+

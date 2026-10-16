@@ -11,6 +11,7 @@ import { createTypeSafeJevScorer } from "./jev-client.js";
 import {
   checkBinaryAvailable,
   chooseSampleStepSeconds,
+  DEFAULT_MAX_SAMPLED_FRAMES,
   exportMovieClip,
   extractSampledFrames,
   moveFileCrossDevice,
@@ -46,6 +47,7 @@ export interface BackendServerOptions {
   ffprobePath?: string;
   ffprobeBin?: string;
   maxUploadBytes?: number;
+  maxSampledFrames?: number;
   windowSize?: number;
   matchThreshold?: number;
   jevScorer?: JevScorer;
@@ -139,6 +141,13 @@ export function createApp(options: BackendServerOptions = {}): {
     Number.isFinite(parsedMaxUpload) && parsedMaxUpload > 0
       ? Math.floor(parsedMaxUpload)
       : 2 * 1024 * 1024 * 1024;
+  const parsedMaxFrames = Number(
+    options.maxSampledFrames ?? process.env.MAX_SAMPLED_FRAMES ?? DEFAULT_MAX_SAMPLED_FRAMES
+  );
+  const maxSampledFrames =
+    Number.isFinite(parsedMaxFrames) && parsedMaxFrames >= 1
+      ? Math.floor(parsedMaxFrames)
+      : DEFAULT_MAX_SAMPLED_FRAMES;
 
   const uploadsTmpDir = path.join(baseConfig.dataDir, "tmp");
   const clipsTmpDir = path.join(baseConfig.dataDir, "clips");
@@ -681,7 +690,8 @@ export function createApp(options: BackendServerOptions = {}): {
       const query = rawQuery.trim();
       const sampleStepSeconds = chooseSampleStepSeconds(
         movie.durationSeconds,
-        req.body?.sampleStepSeconds
+        req.body?.sampleStepSeconds,
+        maxSampledFrames
       );
 
       const searchId = `srch_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
@@ -739,6 +749,8 @@ export function createApp(options: BackendServerOptions = {}): {
         sampleStepSeconds: job.sampleStepSeconds,
         width: movie.width,
         height: movie.height,
+        durationSeconds: movie.durationSeconds,
+        maxFrames: maxSampledFrames,
         ffmpegBin,
         signal: sharedAbortController.signal
       }).finally(() => {
