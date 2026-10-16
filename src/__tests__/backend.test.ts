@@ -1015,6 +1015,42 @@ child.on("exit", (code) => process.exit(code ?? 1));
     expect(finalB.results).toHaveLength(1);
     expect(finalB.results[0].startSeconds).toBe(2);
 
+    // Also test cancelling Search C (sole consumer at step 2s) and immediately retrying Search D at step 2s
+    await fsp.unlink(extractStartedFile).catch(() => undefined);
+    const resC = await fetch(`${server.url}/api/movies/${movie.id}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "green scene C", sampleStepSeconds: 2 })
+    });
+    const { searchId: searchC } = (await resC.json()) as { searchId: string };
+
+    const waitDeadlineC = Date.now() + 5000;
+    while (!fs.existsSync(extractStartedFile) && Date.now() < waitDeadlineC) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(fs.existsSync(extractStartedFile)).toBe(true);
+
+    const cancelResC = await fetch(`${server.url}/api/searches/${searchC}`, {
+      method: "DELETE"
+    });
+    expect(cancelResC.status).toBe(200);
+
+    // Immediately launch Search D with the same (movieId, sampleStepSeconds: 2) before C's extraction cleanup settles
+    const resD = await fetch(`${server.url}/api/movies/${movie.id}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "green scene D", sampleStepSeconds: 2 })
+    });
+    const { searchId: searchD } = (await resD.json()) as { searchId: string };
+
+    const [finalC, finalD] = await Promise.all([
+      pollSearchUntilTerminal(server.url, searchC),
+      pollSearchUntilTerminal(server.url, searchD)
+    ]);
+    expect(finalC.status).toBe("cancelled");
+    expect(finalD.status).toBe("completed");
+    expect(finalD.results).toHaveLength(1);
+
     // Now test that an active clip download stream does not hang server.close()
     const clipRes = await fetch(`${server.url}/api/movies/${movie.id}/clips`, {
       method: "POST",
