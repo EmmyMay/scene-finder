@@ -34,9 +34,9 @@ export PKG_CONFIG_PATH="$build/prefix/lib/pkgconfig"
 extra=(--disable-autodetect)
 suffix=""
 case "$(uname -s)" in
-  Darwin) export MACOSX_DEPLOYMENT_TARGET=13.0; jobs=$(sysctl -n hw.ncpu) ;;
-  Linux) jobs=$(getconf _NPROCESSORS_ONLN) ;;
-  MINGW*|MSYS*) jobs=${NUMBER_OF_PROCESSORS:-4}; suffix=.exe; extra+=(--target-os=mingw32 --arch=x86_64 --cc=gcc --extra-ldflags=-static) ;;
+  Darwin) export MACOSX_DEPLOYMENT_TARGET=13.0; jobs=$(sysctl -n hw.ncpu); extra+=(--enable-pthreads) ;;
+  Linux) jobs=$(getconf _NPROCESSORS_ONLN); extra+=(--enable-pthreads) ;;
+  MINGW*|MSYS*) jobs=${NUMBER_OF_PROCESSORS:-4}; suffix=.exe; extra+=(--target-os=mingw32 --arch=x86_64 --cc=gcc --extra-ldflags=-static --enable-w32threads) ;;
   *) echo 'Unsupported build host' >&2; exit 1 ;;
 esac
 cd "$build/x264-$x264_commit"
@@ -45,7 +45,7 @@ make -j"$jobs"
 make install
 cp COPYING "$out/COPYING.x264"
 cd "$build/ffmpeg-$ffmpeg_version"
-./configure --disable-network --enable-gpl --enable-libx264 --enable-pthreads --enable-static --disable-shared --disable-doc --disable-debug --disable-ffplay --pkg-config-flags=--static "${extra[@]}"
+./configure --disable-network --enable-gpl --enable-libx264 --enable-static --disable-shared --disable-doc --disable-debug --disable-ffplay --pkg-config-flags=--static "${extra[@]}"
 make -j"$jobs" ffmpeg"$suffix" ffprobe"$suffix"
 cp ffmpeg"$suffix" ffprobe"$suffix" COPYING.GPLv2 "$out/"
 cp "$source_dir/prepare-media.sh" "$out/sources/prepare-media.sh"
