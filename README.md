@@ -61,6 +61,12 @@ The current scripts deliberately produce unsigned beta installers. Signing crede
 
 Provide signing access through the OS keychain, provider console, or encrypted CI secrets, not source files or chat. After signing, repeat clean-machine download/install checks and update the website's unsigned-beta notice. Windows signing does not guarantee that SmartScreen reputation prompts disappear immediately.
 
+## Download website
+
+The buildless landing page lives in `website/` and is hosted at [scene-finder.emmyleke.chatgpt.site](https://scene-finder.emmyleke.chatgpt.site/). Preview it with `python3 -m http.server 4175 --bind 127.0.0.1 --directory website`. It contains only public marketing assets and links to versioned GitHub downloads; it does not collect API keys or accept movie uploads.
+
+For Sites publication, copy the website's HTML, CSS, JS and `assets/` into the deployment checkout's `dist/`, and copy `website/.openai/hosting.json` to its `.openai/hosting.json`. Use the Sites source workflow to commit, push, package, save and deploy that exact snapshot. The local deployment checkout is `.data/landing-site` and remains excluded from the application package and this repository. On a new release, verify the actual release assets before updating the website's versioned links.
+
 The movie upload limit defaults to 2 GiB and can be changed with `MAX_UPLOAD_BYTES`. A search is limited to 4,000 sampled frames (`MAX_SAMPLED_FRAMES`); at the default two-second interval, this covers about 133 minutes. Imported movies and temporary search files are local application data; V1 does not provide a library-management interface.
 
 ## Media components
