@@ -6,6 +6,9 @@ on:
   workflow_dispatch:
 permissions:
   contents: read
+concurrency:
+  group: desktop-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   desktop:
     strategy:
@@ -21,6 +24,11 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
+      - uses: actions/cache@v4
+        id: media-cache
+        with:
+          path: .data/media
+          key: native-media-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/prepare-media.sh') }}
       - name: macOS build tools
         if: runner.os == 'macOS'
         run: brew install pkgconf nasm
@@ -50,10 +58,10 @@ jobs:
           MSYS_LOCATION: ${{ steps.msys2.outputs.msys2-location }}
         run: '"$env:MSYS_LOCATION\mingw64\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append'
       - name: Build media tools (macOS/Linux)
-        if: runner.os != 'Windows'
+        if: runner.os != 'Windows' && steps.media-cache.outputs.cache-hit != 'true'
         run: npm run media:prepare
       - name: Build media tools (Windows)
-        if: runner.os == 'Windows'
+        if: runner.os == 'Windows' && steps.media-cache.outputs.cache-hit != 'true'
         shell: msys2 {0}
         run: bash scripts/prepare-media.sh
       - name: Add media tools to PATH
@@ -67,5 +75,5 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: Scene-Finder-${{ runner.os }}-${{ runner.arch }}
-          path: release/
+          path: release/*.tar.gz
           retention-days: 14

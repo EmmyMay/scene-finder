@@ -49,5 +49,8 @@ for (const output of outputs) {
   }
   // An ad-hoc signature is sufficient for this local demo; no signing identity is used.
   if (process.platform === 'darwin') execFileSync('codesign', ['--force', '--deep', '--sign', '-', application], { stdio: 'pipe' });
+  const download = path.join(root, 'release', `Scene-Finder-${process.platform}-${process.arch}.tar.gz`);
+  execFileSync('tar', ['-czf', download, '-C', path.dirname(output), path.basename(output)], { stdio: 'pipe' });
   console.log(`Built ${application}`);
+  console.log(`Download archive: ${download}`);
 }
