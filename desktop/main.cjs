@@ -75,7 +75,11 @@ function createWindow(browserSession) {
   window.webContents.setWindowOpenHandler(() => ({ action: 'deny' }));
   window.webContents.on('will-navigate', (event, url) => { if (!isOwnUrl(url)) event.preventDefault(); });
   window.webContents.on('will-attach-webview', (event) => event.preventDefault());
-  window.once('ready-to-show', () => window?.show());
+  window.once('ready-to-show', () => {
+    window?.show();
+    // OS keychain access can require user interaction; always show the app first.
+    void settings.unlockSavedKey().catch(() => {}).finally(() => window?.webContents.send('settings:changed'));
+  });
   window.on('closed', () => { window = null; });
   void window.loadURL(origin);
 }

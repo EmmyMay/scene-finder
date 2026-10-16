@@ -7,14 +7,26 @@ let currentKey = '';
 let keyFile;
 let appearanceFile;
 let appearance = 'dark';
+let loading = true;
+let connectionError = '';
 let mutationQueue = Promise.resolve();
 const model = process.env.JEV_MODEL || 'jev-preview';
 
+async function keychainOperation(operation) {
+  let timer;
+  try {
+    return await Promise.race([
+      operation,
+      new Promise((_, reject) => { timer = setTimeout(() => reject(new Error('Secure storage did not respond. Unlock your system keychain or password wallet and try again.')), 15000); }),
+    ]);
+  } finally { clearTimeout(timer); }
+}
+
 async function persistKey(key) {
-  if (!await safeStorage.isAsyncEncryptionAvailable() || (process.platform === 'linux' && safeStorage.getSelectedStorageBackend() === 'basic_text')) {
+  if (!await keychainOperation(safeStorage.isAsyncEncryptionAvailable()) || (process.platform === 'linux' && safeStorage.getSelectedStorageBackend() === 'basic_text')) {
     throw new Error('Secure storage is unavailable. Unlock your system keychain or password wallet and try again.');
   }
-  const encrypted = await safeStorage.encryptStringAsync(key);
+  const encrypted = await keychainOperation(safeStorage.encryptStringAsync(key));
   const temporary = `${keyFile}.tmp`;
   await writeFile(temporary, encrypted, { mode: 0o600 });
   await rename(temporary, keyFile);
@@ -25,15 +37,25 @@ async function initialize(userData) {
   keyFile = path.join(userData, 'jev-key.encrypted');
   appearanceFile = path.join(userData, 'appearance');
   try { if (readFileSync(appearanceFile, 'utf8') === 'light') appearance = 'light'; } catch {}
+}
+
+function unlockSavedKey() {
+  return mutateKey(async () => {
+    try { await readSavedKey(); } finally { loading = false; }
+  });
+}
+
+async function readSavedKey() {
   try {
     const encrypted = await readFile(keyFile);
-    const decrypted = await safeStorage.decryptStringAsync(encrypted);
+    const decrypted = await keychainOperation(safeStorage.decryptStringAsync(encrypted));
     currentKey = decrypted.result;
     if (decrypted.shouldReEncrypt) await persistKey(currentKey);
   } catch (error) {
     if (error.code !== 'ENOENT') {
       // Keep an unreadable saved key intact; reconnecting in Settings can replace it.
       currentKey = '';
+      connectionError = 'The saved connection could not be unlocked. Unlock your system keychain or password wallet, then restart Scene Finder or reconnect here.';
       return;
     }
     currentKey = process.env.TYPESAFE_API_KEY?.trim() || '';
@@ -42,7 +64,7 @@ async function initialize(userData) {
 }
 
 function getSettings() {
-  return { configured: Boolean(currentKey), model };
+  return { configured: Boolean(currentKey), model, loading, error: connectionError };
 }
 
 function setAppearance(value) {
@@ -83,6 +105,7 @@ async function validateAndSaveApiKey(value) {
   if (!response.ok) throw new Error('Jev is unavailable right now. Try again shortly.');
   await persistKey(key);
   currentKey = key;
+  connectionError = '';
   return { configured: true };
 }
 
@@ -91,8 +114,9 @@ function clearApiKey() {
     // Persist an empty value so a development environment key is not restored on restart.
     await persistKey('');
     currentKey = '';
+    connectionError = '';
     return { configured: false };
   });
 }
 
-module.exports = { initialize, getSettings, saveApiKey, clearApiKey, getApiKey: () => currentKey, getAppearance: () => appearance, setAppearance };
+module.exports = { initialize, unlockSavedKey, getSettings, saveApiKey, clearApiKey, getApiKey: () => currentKey, getAppearance: () => appearance, setAppearance };

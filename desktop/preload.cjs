@@ -6,4 +6,9 @@ contextBridge.exposeInMainWorld('sceneFinderDesktop', {
   clearApiKey: () => ipcRenderer.invoke('settings:clear'),
   getAppearance: () => ipcRenderer.invoke('appearance:get'),
   setAppearance: (theme) => ipcRenderer.invoke('appearance:set', theme),
+  onConnectionChanged: (callback) => {
+    const listener = () => callback();
+    ipcRenderer.on('settings:changed', listener);
+    return () => ipcRenderer.removeListener('settings:changed', listener);
+  },
 });

@@ -42,7 +42,7 @@ When testing, put `.data/media` on PATH so the suite uses the bundled tools. Pac
 
 These are demo builds: macOS packages use an ad-hoc signature, and Windows packages are unsigned. They are not notarized installers. A passing build is not evidence of hands-on testing on every operating system.
 
-The movie upload limit defaults to 2 GiB and can be changed with `MAX_UPLOAD_BYTES`. Imported movies and temporary search files are local application data; V1 does not provide a library-management interface.
+The movie upload limit defaults to 2 GiB and can be changed with `MAX_UPLOAD_BYTES`. A search is limited to 4,000 sampled frames (`MAX_SAMPLED_FRAMES`); at the default two-second interval, this covers about 133 minutes. Imported movies and temporary search files are local application data; V1 does not provide a library-management interface.
 
 ## Media components
 

@@ -8,13 +8,14 @@ it('keeps Remove connection effective when an older Save is still validating', a
   let validationStarted!: () => void;
   const started = new Promise<void>(resolve => { validationStarted = resolve; });
   const persisted: string[] = [];
+  let savedKeyReads = 0;
   const module = { exports: {} as any };
   const storage = {
     isAsyncEncryptionAvailable: async () => true,
     encryptStringAsync: async (key: string) => Buffer.from(key),
   };
   vm.runInNewContext(readFileSync('desktop/settings.cjs', 'utf8'), {
-    module, Buffer, AbortSignal,
+    module, Buffer, AbortSignal, setTimeout, clearTimeout,
     process: { platform: 'darwin', env: {} },
     require: (name: string) => {
       if (name === 'electron') return { safeStorage: storage };
@@ -22,7 +23,7 @@ it('keeps Remove connection effective when an older Save is still validating', a
       if (name === 'node:fs') return { readFileSync: () => 'dark', writeFileSync: () => {}, renameSync: () => {} };
       if (name === 'node:fs/promises') return {
         mkdir: async () => {},
-        readFile: async () => { throw Object.assign(new Error('Missing'), { code: 'ENOENT' }); },
+        readFile: async () => { savedKeyReads++; throw Object.assign(new Error('Missing'), { code: 'ENOENT' }); },
         writeFile: async (_file: string, data: Buffer) => { persisted.push(data.toString()); },
         rename: async () => {},
       };
@@ -35,6 +36,10 @@ it('keeps Remove connection effective when an older Save is still validating', a
   });
   const settings = module.exports;
   await settings.initialize('/test');
+  expect(savedKeyReads).toBe(0); // Preparing a window must not wait for OS keychain access.
+  expect(settings.getSettings().loading).toBe(true);
+  await settings.unlockSavedKey();
+  expect(settings.getSettings().loading).toBe(false);
   const saving = settings.saveApiKey('dummy-test-key');
   await started;
   const removing = settings.clearApiKey();
