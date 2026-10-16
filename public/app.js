@@ -136,7 +136,9 @@ function connectionLabel() {
 
 function bridgeError(error) {
   // The desktop bridge contract supplies safe human-readable rejection messages.
-  return typeof error?.message === "string" ? error.message : typeof error === "string" ? error : "The connection could not be updated. Try again.";
+  const fallback = "The connection could not be updated. Try again.";
+  const message = typeof error?.message === "string" ? error.message : typeof error === "string" ? error : fallback;
+  return message.replace(/^Error invoking remote method '[^']+': (?:Error: )?/, "").trim() || fallback;
 }
 
 async function openSettings() {
@@ -198,6 +200,7 @@ async function changeConnection(event, remove = false) {
   try {
     const settings = remove ? await desktop.clearApiKey() : await desktop.saveApiKey(key);
     connection.configured = settings.configured === true;
+    settingsError(typeof settings.error === "string" ? settings.error : "");
     ui["connection-status"].textContent = connectionLabel();
     await checkHealth();
   } catch (error) {
