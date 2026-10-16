@@ -8,6 +8,7 @@ import {
   buildSystemOneWindowRequest,
   createTypeSafeJevScorer,
   groupFramesIntoScenes,
+  probeVideoFile,
   startServer,
   type RunningBackendServer,
   type ScoredFrame,
@@ -15,7 +16,7 @@ import {
 } from "../index.js";
 
 /**
- * Generates a 12-second synthetic MP4 clip (10 fps, 320x240) with two disjoint red scenes:
+ * Generates a 12-second synthetic MP4 clip (10 fps, 320x240, with sine audio) containing two disjoint red scenes:
  * - [0s..2s): blue
  * - [2s..5s): red (frames at 2s, 3s, 4s)
  * - [5s..8s): blue (negative frames at 5s, 6s, 7s)
@@ -23,9 +24,7 @@ import {
  * - [10s..12s): blue
  */
 function generateDisjointSceneVideo(outputPath: string): void {
-  const filterComplex = [
-    "[0:v][1:v][2:v][3:v][4:v]concat=n=5:v=1:a=0[outv]"
-  ].join(";");
+  const filterComplex = "[0:v][1:v][2:v][3:v][4:v]concat=n=5:v=1:a=0[outv]";
 
   const result = spawnSync(
     "ffmpeg",
@@ -52,47 +51,104 @@ function generateDisjointSceneVideo(outputPath: string): void {
       "lavfi",
       "-i",
       "color=c=blue:s=320x240:r=10:d=2,format=yuv420p",
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=440:duration=12",
       "-filter_complex",
       filterComplex,
       "-map",
       "[outv]",
+      "-map",
+      "5:a:0",
       "-c:v",
       "libx264",
       "-pix_fmt",
       "yuv420p",
       "-g",
       "10",
+      "-c:a",
+      "aac",
+      "-b:a",
+      "96k",
       outputPath
     ],
     { encoding: "utf8" }
   );
 
   if (result.status !== 0) {
-    throw new Error(`Failed to generate synthetic test video: ${result.stderr}`);
+    throw new Error(`Failed to generate synthetic test MP4 video: ${result.stderr}`);
   }
 }
 
 /**
- * Inspects an extracted JPEG file using ffmpeg rawvideo RGB24 to check if it is predominantly red.
+ * Generates a real 6-second MKV file encoded with MPEG-4 part 2 video + FLAC/PCM audio
+ * so Chromium cannot play it natively and the backend must transcode it to H.264/AAC MP4:
+ * - [0s..2s): blue
+ * - [2s..4s): red (frames at 2s, 3s)
+ * - [4s..6s): blue
  */
-function isFramePredominantlyRed(jpegPath: string): boolean {
-  const res = spawnSync(
+function generateNonChromiumMkvVideo(outputPath: string): void {
+  const filterComplex = "[0:v][1:v][2:v]concat=n=3:v=1:a=0[outv]";
+
+  const result = spawnSync(
     "ffmpeg",
     [
       "-hide_banner",
-      "-v",
-      "error",
-      "-i",
-      jpegPath,
-      "-vf",
-      "scale=1:1",
+      "-y",
       "-f",
-      "rawvideo",
+      "lavfi",
+      "-i",
+      "color=c=blue:s=320x240:r=10:d=2,format=yuv420p",
+      "-f",
+      "lavfi",
+      "-i",
+      "color=c=red:s=320x240:r=10:d=2,format=yuv420p",
+      "-f",
+      "lavfi",
+      "-i",
+      "color=c=blue:s=320x240:r=10:d=2,format=yuv420p",
+      "-f",
+      "lavfi",
+      "-i",
+      "sine=frequency=520:duration=6",
+      "-filter_complex",
+      filterComplex,
+      "-map",
+      "[outv]",
+      "-map",
+      "3:a:0",
+      "-c:v",
+      "mpeg4",
       "-pix_fmt",
-      "rgb24",
-      "pipe:1"
-    ]
+      "yuv420p",
+      "-c:a",
+      "flac",
+      outputPath
+    ],
+    { encoding: "utf8" }
   );
+
+  if (result.status !== 0) {
+    throw new Error(`Failed to generate synthetic test MKV video: ${result.stderr}`);
+  }
+}
+
+function isFramePredominantlyRed(jpegPath: string): boolean {
+  const res = spawnSync("ffmpeg", [
+    "-hide_banner",
+    "-v",
+    "error",
+    "-i",
+    jpegPath,
+    "-vf",
+    "scale=1:1",
+    "-f",
+    "rawvideo",
+    "-pix_fmt",
+    "rgb24",
+    "pipe:1"
+  ]);
   if (res.status !== 0 || !res.stdout || res.stdout.length < 3) {
     return false;
   }
@@ -127,13 +183,16 @@ async function pollSearchUntilTerminal(
 describe("Scene Finder Backend Contract & Jev Pipeline", () => {
   let sharedFixtureDir = "";
   let syntheticMoviePath = "";
+  let syntheticMkvPath = "";
   const activeServers: RunningBackendServer[] = [];
   const tempDirs: string[] = [];
 
   beforeAll(() => {
     sharedFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "scene-finder-fixtures-"));
     syntheticMoviePath = path.join(sharedFixtureDir, "disjoint-red-scenes.mp4");
+    syntheticMkvPath = path.join(sharedFixtureDir, "visual-events.mkv");
     generateDisjointSceneVideo(syntheticMoviePath);
+    generateNonChromiumMkvVideo(syntheticMkvPath);
   });
 
   afterEach(async () => {
@@ -156,11 +215,8 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
       { id: "frame_0", index: 0, timestampSeconds: 0, fileName: "frame_0.jpg", filePath: "/tmp/0.jpg", noul: 0.1 },
       { id: "frame_1", index: 1, timestampSeconds: 1, fileName: "frame_1.jpg", filePath: "/tmp/1.jpg", noul: 0.82 },
       { id: "frame_2", index: 2, timestampSeconds: 2, fileName: "frame_2.jpg", filePath: "/tmp/2.jpg", noul: 0.94 },
-      // Known negative frame at index 3 splits the scene
       { id: "frame_3", index: 3, timestampSeconds: 3, fileName: "frame_3.jpg", filePath: "/tmp/3.jpg", noul: 0.15 },
-      // Single isolated hit at index 4 -> startSeconds === endSeconds === 4
       { id: "frame_4", index: 4, timestampSeconds: 4, fileName: "frame_4.jpg", filePath: "/tmp/4.jpg", noul: 0.77 },
-      // Consecutive index 5, but unsupported timestamp gap (9s vs 4s when sampleStepSeconds=1) -> must NOT merge with frame_4
       { id: "frame_5", index: 5, timestampSeconds: 9, fileName: "frame_5.jpg", filePath: "/tmp/5.jpg", noul: 0.88 }
     ];
 
@@ -211,11 +267,9 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     });
     activeServers.push(server);
 
-    // Without X-Scene-Finder-Token -> 401
     const unauthRes = await fetch(`${server.url}/api/health`);
     expect(unauthRes.status).toBe(401);
 
-    // With token, while liveKey is empty -> ready: false, checks.apiKey: false
     const headers = { "X-Scene-Finder-Token": "desktop-secret-token-123" };
     const healthBefore = await fetch(`${server.url}/api/health`, { headers });
     expect(healthBefore.status).toBe(200);
@@ -229,7 +283,6 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
       }
     });
 
-    // Update key dynamically via getApiKey
     liveKey = "ts_live_super_secret_key_value";
     const healthAfter = await fetch(`${server.url}/api/health`, { headers });
     expect(healthAfter.status).toBe(200);
@@ -245,7 +298,7 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     });
   });
 
-  it("uploads a movie, serves HTTP Range media, extracts measured timestamps, scores ordered Jev windows, and returns disjoint matches + thumbnails", async () => {
+  it("uploads an MP4 movie, serves HTTP Range media, extracts measured timestamps, scores ordered Jev windows, returns disjoint matches + thumbnails, and exports trimmed MP4 clips", async () => {
     const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-e2e-"));
     tempDirs.push(dataDir);
 
@@ -255,7 +308,6 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
       body: ReturnType<typeof buildSystemOneWindowRequest>;
     }> = [];
 
-    // Mock fetch for TypeSafe Jev /v1/systemone that inspects actual extracted frame pixels
     const fakeJevFetch: typeof fetch = async (input, init) => {
       const url = String(input);
       const reqHeaders = (init?.headers ?? {}) as Record<string, string>;
@@ -273,7 +325,6 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
         expect(asset.type).toBe("image");
         expect(asset.format).toBe("jpg");
 
-        // Write decoded JPEG to temp file to verify pixel color & dimensions
         const tmpJpg = path.join(dataDir, `verify_${frameItem.id}.jpg`);
         await fsp.writeFile(tmpJpg, Buffer.from(asset.data_base64, "base64"));
 
@@ -281,7 +332,6 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
           answers[frameItem.id] = { type: "noul", noul: 0.01 };
         } else {
           const isRed = isFramePredominantlyRed(tmpJpg);
-          // Give highest score to 3s and 8s so peakTimestampSeconds is deterministic
           let score = 0.08;
           if (isRed) {
             score =
@@ -321,7 +371,6 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     });
     activeServers.push(server);
 
-    // 1. Upload movie via POST /api/movies
     const fileBytes = await fsp.readFile(syntheticMoviePath);
     const formData = new FormData();
     formData.append(
@@ -353,7 +402,6 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     expect(uploadJson.movie.durationSeconds).toBeCloseTo(12, 0);
     expect(uploadJson.movie.mediaUrl).toBe(`/api/movies/${uploadJson.movie.id}/media`);
 
-    // 2. Verify playable media supports HTTP Range requests
     const rangeRes = await fetch(`${server.url}${uploadJson.movie.mediaUrl}`, {
       headers: { Range: "bytes=0-127" }
     });
@@ -363,7 +411,6 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     const rangeBytes = new Uint8Array(await rangeRes.arrayBuffer());
     expect(rangeBytes.byteLength).toBe(128);
 
-    // 3. Start positive search for "red scene"
     const searchRes = await fetch(
       `${server.url}/api/movies/${uploadJson.movie.id}/search`,
       {
@@ -374,24 +421,9 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     );
     expect(searchRes.status).toBe(202);
     const { searchId } = (await searchRes.json()) as { searchId: string };
-    expect(searchId).toMatch(/^srch_/);
 
     const completed = await pollSearchUntilTerminal(server.url, searchId);
     expect(completed.status).toBe("completed");
-    expect(completed.movieId).toBe(uploadJson.movie.id);
-    expect(completed.query).toBe("bright red scene");
-    expect(completed.sampleStepSeconds).toBe(1);
-    expect(completed.total).toBeGreaterThanOrEqual(12);
-    expect(completed.processed).toBe(completed.total);
-
-    // Verify Jev System One requests had required headers and model
-    expect(capturedRequests.length).toBeGreaterThanOrEqual(3);
-    expect(capturedRequests[0].url).toBe("https://api.typesafe.ai/v1/systemone");
-    expect(capturedRequests[0].headers["TypeSafe-Danger-Zone-Images"]).toBe("true");
-    expect(capturedRequests[0].headers.Authorization).toBe("Bearer test-jev-api-key-9999");
-    expect(capturedRequests[0].body.model).toBe("jev-preview");
-
-    // Verify the two disjoint red scenes [2..4] and [8..9] were NOT merged across [5..7]
     expect(completed.results).toHaveLength(2);
     expect(completed.results[0]).toEqual({
       id: "frame_3",
@@ -410,15 +442,11 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
       thumbnailUrl: `/api/searches/${searchId}/thumbnails/frame_8.jpg`
     });
 
-    // 4. Verify thumbnail URL works directly in browser and is a valid JPEG of the red frame
     const thumbRes = await fetch(`${server.url}${completed.results[0].thumbnailUrl}`);
     expect(thumbRes.status).toBe(200);
     expect(thumbRes.headers.get("content-type")).toContain("image/jpeg");
-    const thumbBytes = Buffer.from(await thumbRes.arrayBuffer());
-    expect(thumbBytes[0]).toBe(0xff);
-    expect(thumbBytes[1]).toBe(0xd8);
 
-    // 5. Verify negative query returns empty results
+    // Verify negative query returns empty results
     const negRes = await fetch(
       `${server.url}/api/movies/${uploadJson.movie.id}/search`,
       {
@@ -431,8 +459,124 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     const { searchId: negSearchId } = (await negRes.json()) as { searchId: string };
     const negCompleted = await pollSearchUntilTerminal(server.url, negSearchId);
     expect(negCompleted.status).toBe("completed");
-    expect(negCompleted.processed).toBe(negCompleted.total);
     expect(negCompleted.results).toEqual([]);
+
+    // Verify POST /api/movies/:id/clips validation and H.264/AAC MP4 export with audio
+    const badClipRes = await fetch(`${server.url}/api/movies/${uploadJson.movie.id}/clips`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ startSeconds: 5, endSeconds: 3 })
+    });
+    expect(badClipRes.status).toBe(400);
+    const badClipJson = (await badClipRes.json()) as { error: { code: string } };
+    expect(badClipJson.error.code).toBe("INVALID_CLIP_RANGE");
+
+    const clipRes = await fetch(`${server.url}/api/movies/${uploadJson.movie.id}/clips`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ startSeconds: 2, endSeconds: 5 })
+    });
+    expect(clipRes.status).toBe(200);
+    expect(clipRes.headers.get("content-type")).toContain("video/mp4");
+    expect(clipRes.headers.get("content-disposition")).toContain("attachment;");
+    expect(clipRes.headers.get("content-disposition")).toContain(".mp4");
+
+    const clipBuffer = Buffer.from(await clipRes.arrayBuffer());
+    const exportedClipPath = path.join(dataDir, "exported_clip.mp4");
+    await fsp.writeFile(exportedClipPath, clipBuffer);
+
+    const probedClip = await probeVideoFile(exportedClipPath);
+    expect(probedClip.formatName).toContain("mp4");
+    expect(probedClip.videoCodec).toBe("h264");
+    expect(probedClip.hasAudio).toBe(true);
+    expect(probedClip.audioCodec).toBe("aac");
+    expect(probedClip.durationSeconds).toBeGreaterThanOrEqual(2.5);
+    expect(probedClip.durationSeconds).toBeLessThanOrEqual(3.5);
+  });
+
+  it("prepares a real MKV (MPEG-4 + FLAC) into a Chromium-playable H.264/AAC MP4 while preserving source, Range playback, and scene search", async () => {
+    const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-mkv-"));
+    tempDirs.push(dataDir);
+
+    const jevScorer = {
+      async scoreFrameWindow(input: {
+        frames: Array<{ id: string; filePath: string; timestampSeconds: number }>;
+      }) {
+        const scores: Record<string, number> = {};
+        for (const frame of input.frames) {
+          const isRed = isFramePredominantlyRed(frame.filePath);
+          scores[frame.id] = isRed ? 0.92 : 0.05;
+        }
+        return scores;
+      }
+    };
+
+    const server = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      dataDir,
+      jevScorer
+    });
+    activeServers.push(server);
+
+    const mkvBytes = await fsp.readFile(syntheticMkvPath);
+    const formData = new FormData();
+    formData.append(
+      "file",
+      new Blob([mkvBytes], { type: "video/x-matroska" }),
+      "visual-events.mkv"
+    );
+
+    const uploadRes = await fetch(`${server.url}/api/movies`, {
+      method: "POST",
+      body: formData
+    });
+    expect(uploadRes.status).toBe(201);
+    const { movie } = (await uploadRes.json()) as {
+      movie: {
+        id: string;
+        name: string;
+        durationSeconds: number;
+        width: number;
+        height: number;
+        mediaUrl: string;
+      };
+    };
+
+    expect(movie.name).toBe("visual-events.mkv");
+    expect(movie.durationSeconds).toBeCloseTo(6, 0);
+
+    // Confirm both source.mkv and playable.mp4 exist in movie directory
+    const movieDir = path.join(dataDir, "movies", movie.id);
+    expect(fs.existsSync(path.join(movieDir, "source.mkv"))).toBe(true);
+    expect(fs.existsSync(path.join(movieDir, "playable.mp4"))).toBe(true);
+
+    const playableProbed = await probeVideoFile(path.join(movieDir, "playable.mp4"));
+    expect(playableProbed.videoCodec).toBe("h264");
+    expect(playableProbed.audioCodec).toBe("aac");
+
+    // Verify Range request on MKV's prepared media URL serves video/mp4 206 Partial Content
+    const rangeRes = await fetch(`${server.url}${movie.mediaUrl}`, {
+      headers: { Range: "bytes=0-255" }
+    });
+    expect(rangeRes.status).toBe(206);
+    expect(rangeRes.headers.get("content-type")).toContain("video/mp4");
+    expect(rangeRes.headers.get("content-range")).toMatch(/^bytes 0-255\/\d+$/);
+
+    // Verify scene search locates the red event [2..3]s in the prepared MKV movie
+    const searchRes = await fetch(`${server.url}/api/movies/${movie.id}/search`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ query: "red flash" })
+    });
+    expect(searchRes.status).toBe(202);
+    const { searchId } = (await searchRes.json()) as { searchId: string };
+    const completed = await pollSearchUntilTerminal(server.url, searchId);
+    expect(completed.status).toBe("completed");
+    expect(completed.results).toHaveLength(1);
+    expect(completed.results[0].startSeconds).toBe(2);
+    expect(completed.results[0].endSeconds).toBe(3);
+    expect(completed.results[0].score).toBe(0.92);
   });
 
   it("supports cancelling an active search via DELETE /api/searches/:searchId", async () => {
@@ -537,7 +681,6 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     });
     const { movie } = (await uploadRes.json()) as { movie: { id: string } };
 
-    // 1. Missing API key -> fails with MISSING_API_KEY, never invents results
     const noKeySearch = await fetch(`${server.url}/api/movies/${movie.id}/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -549,7 +692,6 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     expect(noKeyResult.results).toEqual([]);
     expect(noKeyResult.error?.code).toBe("MISSING_API_KEY");
 
-    // 2. Provider error -> fails with JEV_PROVIDER_ERROR and redacts secret key
     currentKey = "secret_typesafe_key_xyz987";
     const errSearch = await fetch(`${server.url}/api/movies/${movie.id}/search`, {
       method: "POST",

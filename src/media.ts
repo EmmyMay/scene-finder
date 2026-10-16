@@ -1,5 +1,6 @@
 import { spawn } from "node:child_process";
 import fs from "node:fs";
+import fsp from "node:fs/promises";
 import path from "node:path";
 import { AppError } from "./env.js";
 import { roundTimestamp } from "./scene-grouping.js";
@@ -9,6 +10,11 @@ export interface ProbedVideoInfo {
   durationSeconds: number;
   width: number;
   height: number;
+  formatName: string;
+  videoCodec: string;
+  pixFmt: string;
+  audioCodec: string | null;
+  hasAudio: boolean;
 }
 
 export async function checkBinaryAvailable(binary: string): Promise<boolean> {
@@ -99,34 +105,43 @@ function runProcess(
 
 export async function probeVideoFile(
   filePath: string,
-  ffprobeBin = "ffprobe"
+  ffprobeBin = "ffprobe",
+  signal?: AbortSignal
 ): Promise<ProbedVideoInfo> {
   let probeJson: {
     streams?: Array<{
       codec_type?: string;
+      codec_name?: string;
+      pix_fmt?: string;
       width?: number;
       height?: number;
       duration?: string | number;
     }>;
     format?: {
+      format_name?: string;
       duration?: string | number;
     };
   };
 
   try {
-    const { stdout } = await runProcess(ffprobeBin, [
-      "-v",
-      "error",
-      "-select_streams",
-      "v:0",
-      "-show_entries",
-      "stream=codec_type,width,height,duration:format=duration",
-      "-of",
-      "json",
-      filePath
-    ]);
+    const { stdout } = await runProcess(
+      ffprobeBin,
+      [
+        "-v",
+        "error",
+        "-show_entries",
+        "stream=codec_type,codec_name,pix_fmt,width,height,duration:format=format_name,duration",
+        "-of",
+        "json",
+        filePath
+      ],
+      signal
+    );
     probeJson = JSON.parse(stdout);
-  } catch {
+  } catch (err) {
+    if (err instanceof Error && err.name === "AbortError") {
+      throw err;
+    }
     throw new AppError(
       "INVALID_MOVIE",
       "Uploaded file could not be inspected as a valid video file.",
@@ -134,36 +149,43 @@ export async function probeVideoFile(
     );
   }
 
-  const stream = probeJson.streams?.[0];
-  if (!stream || stream.codec_type !== "video") {
+  const streams = probeJson.streams ?? [];
+  const videoStream = streams.find((s) => s.codec_type === "video");
+  if (!videoStream) {
     throw new AppError("INVALID_MOVIE", "Uploaded file does not contain a video stream.", 400);
   }
 
-  const width = Number(stream.width);
-  const height = Number(stream.height);
+  const audioStream = streams.find((s) => s.codec_type === "audio");
+
+  const width = Number(videoStream.width);
+  const height = Number(videoStream.height);
   if (!Number.isInteger(width) || width <= 0 || !Number.isInteger(height) || height <= 0) {
     throw new AppError("INVALID_MOVIE", "Video stream has invalid width or height.", 400);
   }
 
-  let durationSeconds = Number(stream.duration);
+  let durationSeconds = Number(videoStream.duration);
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
     durationSeconds = Number(probeJson.format?.duration);
   }
 
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
-    // Fallback: inspect packet timestamps if container header lacks duration
+    // Fallback: inspect packet timestamps if container header lacks duration (common in MKV/WebM)
     try {
-      const { stdout: packetOut } = await runProcess(ffprobeBin, [
-        "-v",
-        "error",
-        "-select_streams",
-        "v:0",
-        "-show_entries",
-        "packet=pts_time,duration_time",
-        "-of",
-        "json",
-        filePath
-      ]);
+      const { stdout: packetOut } = await runProcess(
+        ffprobeBin,
+        [
+          "-v",
+          "error",
+          "-select_streams",
+          "v:0",
+          "-show_entries",
+          "packet=pts_time,duration_time",
+          "-of",
+          "json",
+          filePath
+        ],
+        signal
+      );
       const packetData = JSON.parse(packetOut) as {
         packets?: Array<{ pts_time?: string; duration_time?: string }>;
       };
@@ -179,8 +201,10 @@ export async function probeVideoFile(
         }
       }
       durationSeconds = maxEnd;
-    } catch {
-      // Ignore fallback error; checked below
+    } catch (err) {
+      if (err instanceof Error && err.name === "AbortError") {
+        throw err;
+      }
     }
   }
 
@@ -195,8 +219,213 @@ export async function probeVideoFile(
   return {
     durationSeconds: roundTimestamp(durationSeconds),
     width,
-    height
+    height,
+    formatName: (probeJson.format?.format_name ?? "").toLowerCase(),
+    videoCodec: (videoStream.codec_name ?? "").toLowerCase(),
+    pixFmt: (videoStream.pix_fmt ?? "").toLowerCase(),
+    audioCodec: audioStream ? (audioStream.codec_name ?? "").toLowerCase() : null,
+    hasAudio: Boolean(audioStream)
   };
+}
+
+export interface PreparePlayableMovieOptions {
+  sourcePath: string;
+  playableOutputPath: string;
+  probed: ProbedVideoInfo;
+  ffmpegBin?: string;
+  ffprobeBin?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * Ensures the movie is in a Chromium-playable H.264/AAC MP4 container:
+ * - If already an MP4 container with H.264 (yuv420p) video and AAC (or no) audio, uses it directly.
+ * - If video is already H.264 (yuv420p) inside MKV/MOV/etc., tries fast remuxing first (copying video, copying/encoding AAC audio).
+ * - Otherwise transcodes to H.264 (yuv420p) + AAC MP4 with +faststart.
+ */
+export async function preparePlayableMovie(
+  options: PreparePlayableMovieOptions
+): Promise<{ playablePath: string; probed: ProbedVideoInfo }> {
+  const ffmpegBin = options.ffmpegBin ?? "ffmpeg";
+  const ffprobeBin = options.ffprobeBin ?? "ffprobe";
+  const ext = path.extname(options.sourcePath).toLowerCase();
+
+  const isMp4Container =
+    (ext === ".mp4" || ext === ".m4v") && options.probed.formatName.includes("mp4");
+  const isCompatibleH264 =
+    options.probed.videoCodec === "h264" &&
+    (options.probed.pixFmt === "yuv420p" || options.probed.pixFmt === "yuvj420p");
+  const isCompatibleAudio =
+    !options.probed.hasAudio || options.probed.audioCodec === "aac";
+
+  if (isMp4Container && isCompatibleH264 && isCompatibleAudio) {
+    return {
+      playablePath: options.sourcePath,
+      probed: options.probed
+    };
+  }
+
+  try {
+    if (isCompatibleH264) {
+      // Fast remux path for MKV/MOV containing H.264 video
+      try {
+        const audioArgs = !options.probed.hasAudio
+          ? ["-an"]
+          : options.probed.audioCodec === "aac"
+            ? ["-map", "0:a:0?", "-c:a", "copy"]
+            : ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k"];
+
+        await runProcess(
+          ffmpegBin,
+          [
+            "-hide_banner",
+            "-nostdin",
+            "-i",
+            options.sourcePath,
+            "-map",
+            "0:v:0",
+            "-c:v",
+            "copy",
+            ...audioArgs,
+            "-movflags",
+            "+faststart",
+            options.playableOutputPath,
+            "-y"
+          ],
+          options.signal
+        );
+
+        const reprobed = await probeVideoFile(
+          options.playableOutputPath,
+          ffprobeBin,
+          options.signal
+        );
+        return {
+          playablePath: options.playableOutputPath,
+          probed: reprobed
+        };
+      } catch (remuxErr) {
+        if (remuxErr instanceof Error && remuxErr.name === "AbortError") {
+          throw remuxErr;
+        }
+        // Fall through to full H.264/AAC transcode if container remux fails
+      }
+    }
+
+    const audioTranscodeArgs = options.probed.hasAudio
+      ? ["-map", "0:a:0?", "-c:a", "aac", "-b:a", "128k"]
+      : ["-an"];
+
+    await runProcess(
+      ffmpegBin,
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        options.sourcePath,
+        "-map",
+        "0:v:0",
+        "-vf",
+        "scale='trunc(iw/2)*2':'trunc(ih/2)*2'",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "22",
+        "-pix_fmt",
+        "yuv420p",
+        ...audioTranscodeArgs,
+        "-movflags",
+        "+faststart",
+        options.playableOutputPath,
+        "-y"
+      ],
+      options.signal
+    );
+
+    const reprobed = await probeVideoFile(
+      options.playableOutputPath,
+      ffprobeBin,
+      options.signal
+    );
+    return {
+      playablePath: options.playableOutputPath,
+      probed: reprobed
+    };
+  } catch (err) {
+    await fsp.unlink(options.playableOutputPath).catch(() => undefined);
+    if (err instanceof Error && err.name === "AbortError") {
+      throw err;
+    }
+    throw new AppError(
+      "MOVIE_PREPARATION_FAILED",
+      "Failed to prepare video for browser playback.",
+      422
+    );
+  }
+}
+
+export interface ExportMovieClipOptions {
+  playableMoviePath: string;
+  outputClipPath: string;
+  startSeconds: number;
+  endSeconds: number;
+  ffmpegBin?: string;
+  signal?: AbortSignal;
+}
+
+/**
+ * Exports an accurate H.264/AAC MP4 clip from `[startSeconds, endSeconds]`, preserving available audio.
+ */
+export async function exportMovieClip(options: ExportMovieClipOptions): Promise<void> {
+  const ffmpegBin = options.ffmpegBin ?? "ffmpeg";
+  try {
+    await runProcess(
+      ffmpegBin,
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-ss",
+        String(roundTimestamp(options.startSeconds)),
+        "-to",
+        String(roundTimestamp(options.endSeconds)),
+        "-i",
+        options.playableMoviePath,
+        "-map",
+        "0:v:0",
+        "-map",
+        "0:a:0?",
+        "-c:v",
+        "libx264",
+        "-preset",
+        "ultrafast",
+        "-crf",
+        "20",
+        "-pix_fmt",
+        "yuv420p",
+        "-c:a",
+        "aac",
+        "-b:a",
+        "128k",
+        "-movflags",
+        "+faststart",
+        options.outputClipPath,
+        "-y"
+      ],
+      options.signal
+    );
+  } catch (err) {
+    await fsp.unlink(options.outputClipPath).catch(() => undefined);
+    if (err instanceof Error && err.name === "AbortError") {
+      throw err;
+    }
+    throw new AppError(
+      "CLIP_EXPORT_FAILED",
+      "Failed to export video clip for the requested time range.",
+      500
+    );
+  }
 }
 
 /**
@@ -230,7 +459,6 @@ export function computeTargetFrameDimensions(
   w = Math.max(MIN_SIDE, Math.min(MAX_SIDE, w));
   h = Math.max(MIN_SIDE, Math.min(MAX_SIDE, h));
 
-  // Ensure even dimensions for encoder compatibility while staying inside [280, 1568]
   if (w % 2 !== 0) {
     w = w < MAX_SIDE ? w + 1 : w - 1;
   }
@@ -259,7 +487,6 @@ export function chooseSampleStepSeconds(
   if (durationSeconds <= 180) {
     return 1;
   }
-  // Keep frame count reasonable for longer videos (~120-180 samples)
   return Math.max(1, Math.ceil(durationSeconds / 150));
 }
 
