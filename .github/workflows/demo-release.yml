@@ -3,7 +3,7 @@ on:
   workflow_dispatch:
     inputs:
       run_id:
-        description: Successful Desktop builds run ID
+        description: Reviewed, successful Desktop builds run ID
         required: true
         type: string
       tag:
@@ -39,7 +39,7 @@ jobs:
           existing=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")
           if [[ -n "$existing" ]]; then echo 'The demo tag already exists.'; exit 1; fi
           gh api "repos/$GH_REPO/actions/runs/$RUN_ID" > run.json
-          jq -e --arg repo "$GH_REPO" '.name == "Desktop builds" and .status == "completed" and .conclusion == "success" and .head_repository.full_name == $repo' run.json
+          jq -e --arg repo "$GH_REPO" '.name == "Desktop builds" and .path == ".github/workflows/desktop.yml" and .status == "completed" and .conclusion == "success" and .head_repository.full_name == $repo' run.json
           revision=$(jq -r .head_sha run.json)
           git merge-base --is-ancestor "$revision" HEAD
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
