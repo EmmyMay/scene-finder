@@ -20,7 +20,8 @@ const state = { generation: 0, movie: null, upload: null, run: null, ready: fals
 const player = ui["movie-player"];
 const desktop = globalThis.sceneFinderDesktop;
 const hasDesktopSettings = desktop && ["getSettings", "saveApiKey", "clearApiKey"].every(method => typeof desktop[method] === "function");
-const connection = { configured: false, loaded: false, busy: false };
+const hasConnectionUpdates = hasDesktopSettings && typeof desktop.onConnectionChanged === "function";
+const connection = { configured: false, loaded: false, busy: false, loading: Boolean(hasConnectionUpdates), refreshPending: false, readError: false };
 // Detached jobs outlive the active movie until cancellation is confirmed.
 const pendingCleanup = new Set();
 const clip = { previewing: false };
@@ -89,9 +90,11 @@ async function checkHealth() {
   try {
     const health = await request("/api/health");
     if (version !== state.healthVersion) return;
-    state.ready = health.ready === true;
+    state.ready = health.ready === true && !connection.loading;
     ui["setup-notice"].replaceChildren();
-    if (!state.ready) {
+    if (connection.loading) {
+      ui["setup-notice"].textContent = "Unlocking saved connection…";
+    } else if (!state.ready) {
       const text = document.createElement("span");
       const needsConnection = hasDesktopSettings && health.checks?.apiKey === false;
       text.textContent = needsConnection ? "Connect Jev in Settings to search your movie. " : hasDesktopSettings ? "Scene Finder is not ready to process movies. Restart the app, then check again. " : "Scene search needs setup. Ask the person running Scene Finder to check the server configuration. ";
@@ -106,26 +109,28 @@ async function checkHealth() {
   } catch {
     if (version !== state.healthVersion) return;
     state.ready = false;
-    ui["setup-notice"].textContent = "Scene Finder could not connect to the server. Check that it is running, then reload this page.";
+    ui["setup-notice"].textContent = connection.loading ? "Unlocking saved connection…" : "Scene Finder could not connect to the server. Check that it is running, then reload this page.";
     ui["setup-notice"].hidden = false;
   }
   updateControls();
 }
 
 function settingsError(message = "") {
+  connection.readError = false;
   ui["settings-error"].textContent = message;
   ui["settings-error"].hidden = !message;
 }
 
 function updateSettingsControls() {
-  ui["settings-form"].setAttribute("aria-busy", String(connection.busy));
-  ui["api-key"].disabled = connection.busy || !connection.loaded;
-  ui["save-connection"].disabled = connection.busy || !connection.loaded || !ui["api-key"].value.trim();
+  ui["settings-form"].setAttribute("aria-busy", String(connection.busy || connection.loading));
+  ui["api-key"].disabled = connection.busy || connection.loading || !connection.loaded;
+  ui["save-connection"].disabled = connection.busy || connection.loading || !connection.loaded || !ui["api-key"].value.trim();
   ui["remove-connection"].hidden = !connection.configured;
-  ui["remove-connection"].disabled = connection.busy;
+  ui["remove-connection"].disabled = connection.busy || connection.loading;
 }
 
 function connectionLabel() {
+  if (connection.loading) return "Unlocking saved connection…";
   return connection.configured ? "Jev is connected" : "Jev is not connected";
 }
 
@@ -140,28 +145,48 @@ async function openSettings() {
   if (connection.busy) return;
   ui["api-key"].value = "";
   settingsError();
+  await refreshConnection();
+  if (ui["settings-dialog"].open && connection.loaded && !connection.loading) ui["api-key"].focus();
+}
+
+async function refreshConnection() {
+  if (!hasDesktopSettings) return;
+  // Coalesce notifications that arrive during a read, save, or removal.
+  if (connection.busy) { connection.refreshPending = true; return; }
   connection.loaded = false;
   connection.busy = true;
-  ui["connection-status"].textContent = "Checking connection…";
+  ui["connection-status"].textContent = connection.loading ? connectionLabel() : "Checking connection…";
   updateSettingsControls();
   try {
     const settings = await desktop.getSettings();
     connection.configured = settings.configured === true;
+    connection.loading = settings.loading === true;
     connection.loaded = true;
+    if (typeof settings.error === "string" && settings.error) {
+      settingsError(settings.error);
+      connection.readError = true;
+    } else if (connection.readError) settingsError();
     ui["connection-status"].textContent = connectionLabel();
   } catch (error) {
+    connection.loading = false;
     ui["connection-status"].textContent = "Connection status unavailable";
     settingsError(bridgeError(error));
+    connection.readError = true;
   } finally {
     connection.busy = false;
-    updateSettingsControls();
-    if (ui["settings-dialog"].open && connection.loaded) ui["api-key"].focus();
+    if (connection.refreshPending) {
+      connection.refreshPending = false;
+      await refreshConnection();
+    } else {
+      updateSettingsControls();
+      await checkHealth();
+    }
   }
 }
 
 async function changeConnection(event, remove = false) {
   event?.preventDefault();
-  if (!hasDesktopSettings || connection.busy || !connection.loaded) return;
+  if (!hasDesktopSettings || connection.busy || connection.loading || !connection.loaded) return;
   const key = ui["api-key"].value.trim();
   if (!remove && !key) return;
   // Keep credentials out of application state and clear the field before crossing the bridge.
@@ -181,6 +206,10 @@ async function changeConnection(event, remove = false) {
   } finally {
     connection.busy = false;
     updateSettingsControls();
+    if (connection.refreshPending) {
+      connection.refreshPending = false;
+      await refreshConnection();
+    }
   }
 }
 
@@ -192,6 +221,7 @@ if (hasDesktopSettings) {
   ui["settings-form"].addEventListener("submit", changeConnection);
   ui["api-key"].addEventListener("input", updateSettingsControls);
   ui["remove-connection"].addEventListener("click", event => changeConnection(event, true));
+  if (hasConnectionUpdates) desktop.onConnectionChanged(() => { void refreshConnection(); });
 }
 
 function clearResults() {
@@ -812,4 +842,5 @@ player.addEventListener("timeupdate", () => {
 player.addEventListener("error", () => { if (state.movie) notice("Scene Finder could not play this movie. Choose it again to retry. If playback still fails, report this app issue."); });
 ui["timeline"].addEventListener("input", () => { if (player.readyState >= 1) player.currentTime = Number(ui["timeline"].value); });
 
-checkHealth();
+if (hasConnectionUpdates) void refreshConnection();
+else checkHealth();
