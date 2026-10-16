@@ -73,7 +73,7 @@ async function request(path, options = {}) {
 
 function errorMessage(error, action) {
   if (error.status === 413) return "This movie is too large to upload. Choose a smaller video and try again.";
-  if (error.status === 415 || /invalid_video|unsupported|probe/i.test(error.code || "")) return "This file could not be read as a movie. Try an MP4 video.";
+  if (error.status === 415 || /invalid_video|unsupported|probe/i.test(error.code || "")) return "This file could not be read as a movie. Choose a valid MKV or MP4 file and try again.";
   if (error.status === 429) return "Scene search is busy. Wait a moment, then try again.";
   if (/key|config|setup|ffmpeg|ffprobe/i.test(error.code || "")) return hasDesktopSettings ? "Scene search needs setup. Open Settings to check your Jev connection, then try again." : "Scene search needs setup. Ask the person running Scene Finder to check the server configuration, then check again above.";
   if (error.status === 404) return "This movie or search is no longer available. Choose your movie again.";
@@ -319,16 +319,20 @@ function uploadMovie(file) {
   resultStatus("Your movie will be ready to search after the upload.");
   updateControls();
 
+  function preparingMovie() {
+    if (generation !== state.generation || state.upload !== xhr) return;
+    ui["upload-label"].textContent = "Preparing movie…";
+    ui["upload-percent"].textContent = "100%";
+    ui["upload-progress"].removeAttribute("value");
+  }
+  xhr.upload.addEventListener("load", preparingMovie);
   xhr.upload.addEventListener("progress", event => {
-    if (generation !== state.generation) return;
+    if (generation !== state.generation || state.upload !== xhr) return;
     if (event.lengthComputable) {
       const percent = Math.min(100, Math.floor(event.loaded / event.total * 100));
       ui["upload-progress"].value = percent;
       ui["upload-percent"].textContent = `${percent}%`;
-      if (percent === 100) {
-        ui["upload-label"].textContent = "Preparing your movie…";
-        ui["upload-progress"].removeAttribute("value");
-      }
+      if (percent === 100) preparingMovie();
     } else {
       ui["upload-progress"].removeAttribute("value");
       ui["upload-percent"].textContent = "";
@@ -630,7 +634,7 @@ player.addEventListener("timeupdate", () => {
   const active = state.results.find(result => player.currentTime >= result.startSeconds && player.currentTime <= Math.max(result.endSeconds, result.startSeconds + .5));
   markActive(active?.id);
 });
-player.addEventListener("error", () => { if (state.movie) notice("This video format cannot play in your browser. You can still search it, or choose an MP4 with H.264 video for playback."); });
+player.addEventListener("error", () => { if (state.movie) notice("Scene Finder could not play this movie. Choose it again to retry. If playback still fails, report this app issue."); });
 ui["timeline"].addEventListener("input", () => { if (player.readyState >= 1) player.currentTime = Number(ui["timeline"].value); });
 
 checkHealth();
