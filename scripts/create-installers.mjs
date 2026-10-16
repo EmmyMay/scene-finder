@@ -11,23 +11,48 @@ const application = path.join(release, `Scene Finder-${process.platform}-${proce
 const run = (command, args) => execFileSync(command, args, { stdio: 'inherit' });
 
 if (process.platform === 'darwin') {
+  const identity = process.env.MAC_SIGNING_IDENTITY;
+  const notaryProfile = process.env.MAC_NOTARY_PROFILE;
+  if (notaryProfile && !identity) throw new Error('MAC_NOTARY_PROFILE requires MAC_SIGNING_IDENTITY.');
   const staging = await mkdtemp(path.join(os.tmpdir(), 'scene-installer-'));
   try {
     const stagedApp = path.join(staging, 'Scene Finder.app');
     // Framework links must stay relative; Node's default copy rewrites them to the source path.
     await cp(path.join(application, 'Scene Finder.app'), stagedApp, { recursive: true, verbatimSymlinks: true });
     run('codesign', ['--verify', '--deep', '--strict', stagedApp]);
+    if (identity) {
+      run('codesign', ['--verify', '--test-requirement',
+        '=anchor apple generic and certificate leaf[field.1.2.840.113635.100.6.1.13] exists', stagedApp]);
+    }
     await symlink('/Applications', path.join(staging, 'Applications'));
     await writeFile(path.join(staging, 'Install Scene Finder.txt'),
       'Drag Scene Finder into Applications, then open it from Applications.\n\n' +
       'Connect your own Jev API key in Settings, then choose an MP4 or MKV movie.\n' +
       'Search requires an internet connection. Sampled movie frames and your query go to Jev.\n\n' +
-      'This beta is ad-hoc signed, not Developer ID signed or notarized.\n' +
+      (identity ? 'This app is signed with a Developer ID Application certificate.\n' :
+        'This beta is ad-hoc signed, not Developer ID signed or notarized.\n') +
       'Download and release information: https://github.com/EmmyMay/scene-finder/releases\n');
     await copyFile(path.join(root, 'desktop/assets/icon.icns'), path.join(staging, '.VolumeIcon.icns'));
     const destination = path.join(release, `Scene-Finder-${version}-mac-${process.arch}.dmg`);
     run('hdiutil', ['create', '-ov', '-volname', 'Scene Finder', '-fs', 'HFS+', '-format', 'UDZO', '-srcfolder', staging, destination]);
     run('hdiutil', ['verify', destination]);
+    if (identity) {
+      run('codesign', ['--force', '--sign', identity, '--timestamp', destination]);
+      run('codesign', ['--verify', '--verbose=2', destination]);
+    }
+    if (notaryProfile) {
+      console.log('Submitting the signed installer to Apple for notarization...');
+      const submission = JSON.parse(execFileSync('xcrun', [
+        'notarytool', 'submit', destination, '--keychain-profile', notaryProfile, '--wait', '--output-format', 'json',
+      ], { encoding: 'utf8', stdio: ['ignore', 'pipe', 'inherit'] }));
+      if (submission.status !== 'Accepted') {
+        throw new Error(`Apple notarization ${submission.status}; submission ${submission.id}. Inspect it with xcrun notarytool log.`);
+      }
+      console.log(`Apple accepted notarization: ${submission.id}`);
+      run('xcrun', ['stapler', 'staple', destination]);
+      run('xcrun', ['stapler', 'validate', destination]);
+      run('spctl', ['--assess', '--type', 'open', '--context', 'context:primary-signature', '--verbose=2', destination]);
+    }
     console.log(`Mac installer: ${destination}`);
   } finally {
     await rm(staging, { recursive: true, force: true });
