@@ -235,8 +235,8 @@ export function createApp(options: BackendServerOptions = {}): {
   // GET /api/health
   app.get("/api/health", async (_req: Request, res: Response) => {
     const [ffmpegOk, ffprobeOk] = await Promise.all([
-      checkBinaryAvailable(ffmpegBin),
-      checkBinaryAvailable(ffprobeBin)
+      checkBinaryAvailable(ffmpegBin).catch(() => false),
+      checkBinaryAvailable(ffprobeBin).catch(() => false)
     ]);
     const apiKeyOk = Boolean(options.jevScorer) || getCurrentApiKey().length > 0;
     const payload: HealthResponse = {

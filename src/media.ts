@@ -60,10 +60,17 @@ export async function checkBinaryAvailable(binary: string): Promise<boolean> {
       }
     };
 
-    const child = spawn(binary, ["-version"], {
-      stdio: ["ignore", "ignore", "ignore"],
-      detached: process.platform !== "win32"
-    });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(binary, ["-version"], {
+        stdio: ["ignore", "ignore", "ignore"],
+        detached: process.platform !== "win32"
+      });
+    } catch {
+      finish(false);
+      return;
+    }
+
     const timer = setTimeout(() => {
       killChildProcessTree(child);
       finish(false);
@@ -94,10 +101,17 @@ function runProcess(
     }
 
     let settled = false;
-    const child = spawn(command, args, {
-      stdio: ["ignore", "pipe", "pipe"],
-      detached: process.platform !== "win32"
-    });
+    let child: ReturnType<typeof spawn>;
+    try {
+      child = spawn(command, args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        detached: process.platform !== "win32"
+      });
+    } catch (spawnErr) {
+      settled = true;
+      reject(spawnErr instanceof Error ? spawnErr : new Error(String(spawnErr)));
+      return;
+    }
 
     let stdout = "";
     let stderr = "";
@@ -114,13 +128,13 @@ function runProcess(
 
     signal?.addEventListener("abort", onAbort, { once: true });
 
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
+    child.stdout?.setEncoding("utf8");
+    child.stderr?.setEncoding("utf8");
 
-    child.stdout.on("data", (chunk: string) => {
+    child.stdout?.on("data", (chunk: string) => {
       stdout += chunk;
     });
-    child.stderr.on("data", (chunk: string) => {
+    child.stderr?.on("data", (chunk: string) => {
       stderr += chunk;
     });
 
@@ -565,7 +579,7 @@ export function chooseSampleStepSeconds(
   if (durationSeconds <= 2) {
     return 0.5;
   }
-  if (durationSeconds <= 120) {
+  if (durationSeconds <= 15) {
     return 1;
   }
   return 2;

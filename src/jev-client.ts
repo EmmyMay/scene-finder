@@ -102,10 +102,10 @@ export function buildSystemOneWindowRequest(
     // reference string is expanded only once in state.
     questions[frame.id] = {
       type: "noul",
-      instructions: `Inspect movie frame \`frames[${windowPosition}].image\` at timestamp ${frame.timestampSeconds}s in the ordered \`frames\` window. Does this frame match the scene described in \`query\`: "${input.query}"?`,
+      instructions: `Inspect movie frame \`frames[${windowPosition}].image\` at timestamp ${frame.timestampSeconds}s in the ordered \`frames\` window. Does this specific frame directly show the visible action and details requested in \`query\`: "${input.query}"?`,
       criteria: {
-        true: `The frame visually shows or belongs to the scene described as: ${input.query}`,
-        false: `The frame does not show the scene described as: ${input.query}`
+        true: `The frame visibly depicts the specific action, subject, and details described in query (${input.query}), not merely the same character or setting in an unrelated shot.`,
+        false: `The frame does not visibly show the specific action or details described in query (${input.query}).`
       }
     };
   });
