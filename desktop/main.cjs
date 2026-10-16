@@ -88,5 +88,6 @@ app.on('window-all-closed', () => app.quit());
 app.on('before-quit', (event) => {
   if (quitting || !backend) return;
   event.preventDefault(); quitting = true;
-  backend.close().finally(() => app.quit());
+  // Native keychain calls can outlive their timeout; quit once our media service is closed.
+  backend.close().finally(() => app.exit(0));
 });

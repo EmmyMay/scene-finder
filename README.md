@@ -27,7 +27,7 @@ npm run desktop
 - Windows x64: MSYS2 MINGW64 with GCC, make, pkgconf, nasm, curl, tar and xz. Run media preparation in that shell. The packaged app does not need MSYS2.
 - Linux x64: a C compiler, make, pkg-config, nasm, curl, tar and xz. Omarchy support is best effort; an unlocked Secret Service password store is needed to save a key securely.
 
-The desktop process binds its local service to loopback, authenticates media/API requests with a per-launch token, and keeps the Jev key in OS-encrypted storage. Theme preferences survive application restarts. Imported movies are stored under the operating system's Scene Finder application-data folder.
+The desktop process binds its local service to loopback, authenticates media/API requests with a per-launch token, and keeps the Jev key in OS-encrypted storage. If secure storage is unavailable, a validated key works for the current session with a visible warning; it is never saved unencrypted. Theme preferences survive application restarts. Imported movies are stored under the operating system's Scene Finder application-data folder.
 
 ## Validate and package
 

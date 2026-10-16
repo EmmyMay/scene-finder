@@ -27,8 +27,12 @@ async function persistKey(key) {
     throw new Error('Secure storage is unavailable. Unlock your system keychain or password wallet and try again.');
   }
   const encrypted = await keychainOperation(safeStorage.encryptStringAsync(key));
+  await writeKeyFile(encrypted);
+}
+
+async function writeKeyFile(contents) {
   const temporary = `${keyFile}.tmp`;
-  await writeFile(temporary, encrypted, { mode: 0o600 });
+  await writeFile(temporary, contents, { mode: 0o600 });
   await rename(temporary, keyFile);
 }
 
@@ -48,6 +52,7 @@ function unlockSavedKey() {
 async function readSavedKey() {
   try {
     const encrypted = await readFile(keyFile);
+    if (encrypted.length === 0) { currentKey = ''; return; }
     const decrypted = await keychainOperation(safeStorage.decryptStringAsync(encrypted));
     currentKey = decrypted.result;
     if (decrypted.shouldReEncrypt) await persistKey(currentKey);
@@ -103,16 +108,20 @@ async function validateAndSaveApiKey(value) {
     throw new Error('Jev did not accept this key. Check the key and try again.');
   }
   if (!response.ok) throw new Error('Jev is unavailable right now. Try again shortly.');
-  await persistKey(key);
+  try {
+    await persistKey(key);
+    connectionError = '';
+  } catch {
+    connectionError = 'Connected for this session. Your key could not be saved securely. Unlock your system keychain or password wallet, then save the connection again to remember it.';
+  }
   currentKey = key;
-  connectionError = '';
-  return { configured: true };
+  return { configured: true, error: connectionError };
 }
 
 function clearApiKey() {
   return mutateKey(async () => {
-    // Persist an empty value so a development environment key is not restored on restart.
-    await persistKey('');
+    // An empty marker contains no credential and prevents a development key being restored.
+    await writeKeyFile(Buffer.alloc(0));
     currentKey = '';
     connectionError = '';
     return { configured: false };
