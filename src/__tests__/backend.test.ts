@@ -255,9 +255,10 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
   });
 
   it("splits on known negative frames, supports single-frame hits, refuses to merge across unsupported gaps, and uses consistent sampling steps", () => {
-    // 2h movie uses consistent 2s step instead of 48s
+    // 90s and 2h movies use consistent 2s step instead of 48s; short <=15s clips use 1s
     expect(chooseSampleStepSeconds(7200)).toBe(2);
-    expect(chooseSampleStepSeconds(60)).toBe(1);
+    expect(chooseSampleStepSeconds(90)).toBe(2);
+    expect(chooseSampleStepSeconds(12)).toBe(1);
     expect(chooseSampleStepSeconds(1.5)).toBe(0.5);
     expect(() => chooseSampleStepSeconds(12, 0.0001)).toThrow(/sampleStepSeconds/);
     expect(() => chooseSampleStepSeconds(12, 0)).toThrow(/sampleStepSeconds/);
@@ -346,6 +347,27 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
         apiKey: true,
         ffmpeg: true,
         ffprobe: true
+      }
+    });
+
+    // Verify synchronous/broken binary path resolves ffprobe: false cleanly
+    const brokenBinServer = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      dataDir,
+      apiKey: "valid-key",
+      ffprobePath: "/nonexistent/bad-arch-ffprobe\0invalid"
+    });
+    activeServers.push(brokenBinServer);
+
+    const brokenHealth = await fetch(`${brokenBinServer.url}/api/health`);
+    expect(brokenHealth.status).toBe(200);
+    expect(await brokenHealth.json()).toEqual({
+      ready: false,
+      checks: {
+        apiKey: true,
+        ffmpeg: true,
+        ffprobe: false
       }
     });
   });
