@@ -1,4 +1,4 @@
-name: Publish demo downloads
+name: Publish desktop downloads
 on:
   workflow_dispatch:
     inputs:
@@ -9,7 +9,7 @@ on:
       tag:
         description: New prerelease tag
         required: true
-        default: v1.0.0-demo.1
+        default: v1.0.1-beta.1
         type: string
 permissions:
   actions: read
@@ -35,14 +35,17 @@ jobs:
         shell: bash
         run: |
           [[ "$RUN_ID" =~ ^[0-9]+$ ]]
-          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-demo\.[0-9]+$ ]]
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-(demo|beta)\.[0-9]+$ ]]
           existing=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")
           if [[ -n "$existing" ]]; then echo 'The demo tag already exists.'; exit 1; fi
           gh api "repos/$GH_REPO/actions/runs/$RUN_ID" > run.json
-          jq -e --arg repo "$GH_REPO" '.name == "Desktop builds" and .path == ".github/workflows/desktop.yml" and .status == "completed" and .conclusion == "success" and .head_repository.full_name == $repo' run.json
+          jq -e --arg repo "$GH_REPO" '.name == "Desktop builds" and .path == ".github/workflows/desktop.yml" and .status == "completed" and .conclusion == "success" and .head_repository.full_name == $repo and .head_branch == "master" and (.event == "push" or .event == "workflow_dispatch")' run.json
           revision=$(jq -r .head_sha run.json)
           git merge-base --is-ancestor "$revision" HEAD
+          version=$(git show "$revision:package.json" | jq -r .version)
+          [[ "$RELEASE_TAG" == "v$version-"* ]]
           echo "revision=$revision" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
       - uses: actions/download-artifact@v4
         with:
           github-token: ${{ github.token }}
@@ -54,19 +57,26 @@ jobs:
         shell: bash
         env:
           SOURCE_REVISION: ${{ steps.source.outputs.revision }}
+          APP_VERSION: ${{ steps.source.outputs.version }}
         run: |
           python3 - <<'PY'
           from pathlib import Path
-          expected = {'Scene-Finder-darwin-arm64.tar.gz', 'Scene-Finder-win32-x64.tar.gz', 'Scene-Finder-linux-x64.tar.gz'}
-          assert {p.name for p in Path('downloads').iterdir()} == expected, 'Expected all three platform archives'
+          import os
+          version = os.environ['APP_VERSION']
+          expected = {f'Scene-Finder-{version}-mac-arm64.dmg', f'Scene-Finder-{version}-windows-x64-setup.exe', 'Scene-Finder-linux-x64.tar.gz'}
+          assert {p.name for p in Path('downloads').iterdir()} == expected, 'Expected Mac DMG, Windows installer, and Linux archive'
           PY
-          (cd downloads && sha256sum ./*.tar.gz > SHA256SUMS.txt)
+          (cd downloads && sha256sum ./*.dmg ./*-setup.exe ./*.tar.gz > SHA256SUMS.txt)
           cat > release-notes.md <<'NOTES'
-          Demo builds for macOS Apple silicon, Windows x64, and Linux x64. Omarchy is best effort.
+          Scene Finder beta for macOS Apple silicon, Windows x64, and Linux x64. Omarchy is best effort.
 
-          Extract the archive and open Scene Finder from its folder. Connect your Jev key in Settings, load an MKV or MP4, describe a visible moment, then seek, trim and export a clip.
+          **Mac:** Open the DMG and drag Scene Finder into Applications. Requires macOS 13 or later and an Apple silicon Mac; Intel Macs are not supported by this build.
+          **Windows:** Run the setup EXE. Installs for your user account, adds a Start menu shortcut, and includes an uninstaller. Requires Windows 10 or 11, x64.
+          **Linux:** Extract the archive and open Scene Finder from its folder.
 
-          These are unsigned demo builds (ad-hoc signed on macOS), not notarized installers. Native media checks, tests and packaging passed on all three operating systems; hands-on app verification was performed on macOS.
+          Connect your own Jev key in Settings, load an MKV or MP4, describe a visible moment, then seek, trim and export a clip. Jev usage is charged to your own provider account. No key or search credit is included.
+
+          These beta installers are **not code signed for public distribution**: macOS is ad-hoc signed and not notarized; Windows is unsigned. Operating-system security prompts are expected. Native media checks, tests and packaging passed on all three operating systems. Windows CI also exercises installation, app startup and uninstall; hands-on app verification was performed on macOS.
 
           Movies remain local. Search sends sampled frames to Jev. Matching times are approximate. Media source archives, build instructions and license notices are included inside each package.
           NOTES

@@ -26,6 +26,8 @@ const outputs = await packager({
   executableName: 'Scene Finder',
   appBundleId: 'com.emmymay.scenefinder',
   appCategoryType: 'public.app-category.video',
+  icon: path.join(root, 'desktop/assets/icon'),
+  win32metadata: { CompanyName: 'EmmyMay', FileDescription: 'Scene Finder', ProductName: 'Scene Finder' },
   platform: process.platform,
   arch: process.arch,
   electronVersion,
@@ -53,9 +55,12 @@ for (const output of outputs) {
   }
   // An ad-hoc signature is sufficient for this local demo; no signing identity is used.
   if (process.platform === 'darwin') execFileSync('codesign', ['--force', '--deep', '--sign', '-', application], { stdio: 'pipe' });
-  const download = path.join(root, 'release', `Scene-Finder-${process.platform}-${process.arch}.tar.gz`);
-  execFileSync('tar', ['-czf', download, '-C', path.dirname(output), path.basename(output)], { stdio: 'pipe' });
+  if (process.platform === 'linux') {
+    const download = path.join(root, 'release', `Scene-Finder-${process.platform}-${process.arch}.tar.gz`);
+    execFileSync('tar', ['-czf', download, '-C', path.dirname(output), path.basename(output)], { stdio: 'pipe' });
+    console.log(`Download archive: ${download}`);
+  }
   console.log(`Built ${application}`);
-  console.log(`Download archive: ${download}`);
 }
 } finally { await rm(staging, { recursive: true, force: true }); }
+await import('./create-installers.mjs');

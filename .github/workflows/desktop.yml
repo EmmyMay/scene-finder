@@ -77,8 +77,16 @@ jobs:
       - run: npm run typecheck
       - run: npm test
       - run: npm run package:desktop
+      - name: Install, launch and uninstall Windows app
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: ./scripts/check-windows-installer.ps1
       - uses: actions/upload-artifact@v4
         with:
           name: Scene-Finder-${{ runner.os }}-${{ runner.arch }}
-          path: release/*.tar.gz
+          path: |
+            release/*.dmg
+            release/*-setup.exe
+            release/*.tar.gz
+          if-no-files-found: error
           retention-days: 14
