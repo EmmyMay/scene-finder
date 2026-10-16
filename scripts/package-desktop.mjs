@@ -7,6 +7,10 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+const macSigningIdentity = process.platform === 'darwin' ? process.env.MAC_SIGNING_IDENTITY : undefined;
+if (process.platform === 'darwin' && process.env.MAC_NOTARY_PROFILE && !macSigningIdentity) {
+  throw new Error('MAC_NOTARY_PROFILE requires MAC_SIGNING_IDENTITY.');
+}
 await import('./check-media.mjs');
 if (!['darwin', 'win32', 'linux'].includes(process.platform)) throw new Error('Unsupported desktop platform.');
 // Stage only app files, then install production dependencies outside cloud-synced workspaces.
@@ -35,6 +39,15 @@ const outputs = await packager({
   overwrite: true,
   prune: false,
   extraResource: [path.join(root, '.data/media')],
+  osxSign: macSigningIdentity ? {
+    identity: macSigningIdentity,
+    preAutoEntitlements: false,
+    // Electron needs JIT in its app processes; bundled media tools need no entitlements.
+    optionsForFile: file => ({
+      hardenedRuntime: true,
+      entitlements: file.endsWith('.app') ? ['com.apple.security.cs.allow-jit'] : [],
+    }),
+  } : undefined,
 });
 for (const output of outputs) {
   const application = process.platform === 'darwin' ? path.join(output, 'Scene Finder.app') : output;
@@ -53,8 +66,8 @@ for (const output of outputs) {
   } catch (error) {
     if (error.code !== 'ENOENT') throw error;
   }
-  // An ad-hoc signature is sufficient for this local demo; no signing identity is used.
-  if (process.platform === 'darwin') execFileSync('codesign', ['--force', '--deep', '--sign', '-', application], { stdio: 'pipe' });
+  // Local/CI beta builds remain available without access to a Developer ID certificate.
+  if (process.platform === 'darwin' && !macSigningIdentity) execFileSync('codesign', ['--force', '--deep', '--sign', '-', application], { stdio: 'pipe' });
   if (process.platform === 'linux') {
     const download = path.join(root, 'release', `Scene-Finder-${process.platform}-${process.arch}.tar.gz`);
     execFileSync('tar', ['-czf', download, '-C', path.dirname(output), path.basename(output)], { stdio: 'pipe' });

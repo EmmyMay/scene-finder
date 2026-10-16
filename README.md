@@ -54,12 +54,27 @@ The **Publish desktop downloads** workflow takes a successful **Desktop builds**
 
 ## Signing before general release
 
-The current scripts deliberately produce unsigned beta installers. Signing credentials are not configured or bundled.
+By default, builds produce unsigned beta installers. Mac builds can use a Developer ID identity and a notarization profile from the builder's Keychain; credentials are never bundled.
 
-- **macOS:** an active Apple Developer Program membership, the Team ID, and a **Developer ID Application** certificate with access to its private key. For CI, use a password-protected certificate export in encrypted GitHub secrets. Notarization also needs an App Store Connect API key (key ID, issuer ID, and private `.p8` key), or an Apple ID with an app-specific password and Team ID. A Developer ID Installer certificate is not needed for our drag-and-drop DMG. Once available, configure hardened-runtime signing for the app and nested executables, sign the DMG, submit it for notarization, staple the ticket, and verify with Gatekeeper. See [Apple's Developer ID guide](https://developer.apple.com/developer-id/).
+- **macOS:** an active Apple Developer Program membership, the Team ID, and a **Developer ID Application** certificate with access to its private key. For CI, use a password-protected certificate export in encrypted GitHub secrets. Notarization also needs a Keychain profile authenticated with an App Store Connect API key or an Apple ID with an app-specific password and Team ID. A Developer ID Installer certificate is not needed for our drag-and-drop DMG. See [Apple's Developer ID guide](https://developer.apple.com/developer-id/).
 - **Windows:** the publisher's legal name and access to a public-trust Authenticode code-signing certificate/service, including its hardware or cloud key access and CI authentication. Sign the app, generated uninstaller and setup EXE with a trusted timestamp. If using Azure Artifact Signing, provide its account, certificate profile, endpoint and Entra identity permissions. Check [Microsoft's eligibility requirements](https://learn.microsoft.com/en-us/azure/artifact-signing/quickstart) first: public-trust individual accounts currently require US or Canadian residency; organization eligibility also depends on country. Another public-trust provider may be required.
 
-Provide signing access through the OS keychain, provider console, or encrypted CI secrets, not source files or chat. After signing, repeat clean-machine download/install checks and update the website's unsigned-beta notice. Windows signing does not guarantee that SmartScreen reputation prompts disappear immediately.
+To configure local Mac notarization, store an existing app-specific password using the secure interactive prompt (never put the password in the command):
+
+```sh
+xcrun notarytool store-credentials scene-finder --apple-id YOUR_APPLE_ID --team-id YOUR_TEAM_ID
+```
+
+Then build with the exact Developer ID identity shown by `security find-identity -v -p codesigning`:
+
+```sh
+MAC_SIGNING_IDENTITY='Developer ID Application: YOUR_NAME (YOUR_TEAM_ID)' \
+MAC_NOTARY_PROFILE=scene-finder npm run package:desktop
+```
+
+This signs the app and its nested executables with hardened runtime, signs the DMG, submits the DMG to Apple, and requires an Accepted result before stapling and validating its ticket and checking Gatekeeper. Setting only `MAC_SIGNING_IDENTITY` produces a signed installer without submitting it to Apple. Automated CI builds still use the unsigned beta path until signing access is configured there.
+
+Provide signing access through the OS keychain, provider console, or encrypted CI secrets, not source files or chat. After signing, repeat clean-machine download/install checks. Windows signing does not guarantee that SmartScreen reputation prompts disappear immediately.
 
 ## Download website
 
