@@ -13,7 +13,10 @@ const run = (command, args) => execFileSync(command, args, { stdio: 'inherit' })
 if (process.platform === 'darwin') {
   const staging = await mkdtemp(path.join(os.tmpdir(), 'scene-installer-'));
   try {
-    await cp(path.join(application, 'Scene Finder.app'), path.join(staging, 'Scene Finder.app'), { recursive: true });
+    const stagedApp = path.join(staging, 'Scene Finder.app');
+    // Framework links must stay relative; Node's default copy rewrites them to the source path.
+    await cp(path.join(application, 'Scene Finder.app'), stagedApp, { recursive: true, verbatimSymlinks: true });
+    run('codesign', ['--verify', '--deep', '--strict', stagedApp]);
     await symlink('/Applications', path.join(staging, 'Applications'));
     await writeFile(path.join(staging, 'Install Scene Finder.txt'),
       'Drag Scene Finder into Applications, then open it from Applications.\n\n' +
