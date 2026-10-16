@@ -10,6 +10,7 @@ const ui = Object.fromEntries([
   "search-count", "results-heading", "results-count", "results-status", "results-list",
   "sample-note", "settings-button", "settings-dialog", "close-settings", "settings-form",
   "api-key", "connection-status", "settings-error", "save-connection", "remove-connection",
+  "cleanup-notice", "cleanup-message", "retry-cleanup",
 ].map(id => [id, document.getElementById(id)]));
 
 const state = { generation: 0, movie: null, upload: null, run: null, ready: false, results: [], duration: 0 };
@@ -17,6 +18,8 @@ const player = ui["movie-player"];
 const desktop = globalThis.sceneFinderDesktop;
 const hasDesktopSettings = desktop && ["getSettings", "saveApiKey", "clearApiKey"].every(method => typeof desktop[method] === "function");
 const connection = { configured: false, loaded: false, busy: false };
+// Detached jobs outlive the active movie until cancellation is confirmed.
+const pendingCleanup = new Set();
 
 function timecode(seconds) {
   const total = Math.max(0, Math.floor(Number(seconds) || 0));
@@ -43,8 +46,8 @@ function resultStatus(message) {
 }
 
 function updateControls() {
-  ui["scene-query"].disabled = !state.movie || Boolean(state.upload);
-  ui["search-button"].disabled = !state.movie || !state.ready || Boolean(state.upload || state.run) || !ui["scene-query"].value.trim();
+  ui["scene-query"].disabled = !state.movie || Boolean(state.upload || state.run);
+  ui["search-button"].disabled = !state.movie || !state.ready || Boolean(state.upload || state.run) || pendingCleanup.size > 0 || !ui["scene-query"].value.trim();
   ui["search-form"].setAttribute("aria-busy", String(Boolean(state.run)));
 }
 
@@ -204,13 +207,63 @@ function isCurrent(run) {
 
 async function deleteSearch(run) {
   if (!run.id) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
   try {
-    await request(`/api/searches/${encodeURIComponent(run.id)}`, { method: "DELETE" });
+    await request(`/api/searches/${encodeURIComponent(run.id)}`, { method: "DELETE", signal: controller.signal });
   } catch (error) {
     // A search removed by the server has no remaining work to cancel.
     if (error.status !== 404) throw error;
+  } finally {
+    clearTimeout(timeout);
   }
 }
+
+function updateCleanupNotice() {
+  const jobs = [...pendingCleanup];
+  ui["cleanup-notice"].hidden = jobs.length === 0;
+  if (jobs.some(run => run.creationUncertain)) {
+    ui["cleanup-message"].textContent = hasDesktopSettings ? "A search response was lost, so cancellation cannot be confirmed. Quit and reopen Scene Finder before searching again." : "A search response was lost, so cancellation cannot be confirmed. Restart the Scene Finder server before searching again.";
+  } else if (jobs.some(run => run.cleanupFailures > 0)) {
+    ui["cleanup-message"].textContent = "A previous search could not be stopped and may still be running. Check your connection and retry cancellation. New searches are paused until it stops.";
+  } else {
+    ui["cleanup-message"].textContent = "Stopping the previous search before starting another…";
+  }
+  ui["retry-cleanup"].hidden = !jobs.some(run => run.id && run.cleanupFailures > 0);
+  ui["retry-cleanup"].disabled = !jobs.some(run => run.id && !run.cleanupBusy);
+  updateControls();
+}
+
+async function retryCleanup(run) {
+  if (!pendingCleanup.has(run) || !run.id || run.cleanupBusy) return;
+  clearTimeout(run.cleanupTimer);
+  run.cleanupBusy = true;
+  updateCleanupNotice();
+  try {
+    await deleteSearch(run);
+    pendingCleanup.delete(run);
+  } catch {
+    run.cleanupFailures = (run.cleanupFailures || 0) + 1;
+    // Keep the job and its ID after bounded retries so the user can retry explicitly.
+    if (run.cleanupFailures < 3) run.cleanupTimer = setTimeout(() => retryCleanup(run), 1000 * run.cleanupFailures);
+  } finally {
+    run.cleanupBusy = false;
+    updateCleanupNotice();
+  }
+}
+
+function queueCleanup(run) {
+  pendingCleanup.add(run);
+  updateCleanupNotice();
+  if (run.id) retryCleanup(run);
+}
+
+ui["retry-cleanup"].addEventListener("click", () => {
+  for (const run of pendingCleanup) if (run.id && !run.cleanupBusy) {
+    run.cleanupFailures = 0;
+    retryCleanup(run);
+  }
+});
 
 function detachSearch() {
   const old = state.run;
@@ -218,8 +271,8 @@ function detachSearch() {
   if (old) {
     clearTimeout(old.timer);
     old.controller?.abort();
-    // A pending creation request will cancel its search as soon as the ID arrives.
-    if (old.id) deleteSearch(old).catch(() => {});
+    // Preserve even a pending creation until its eventual ID can be cancelled.
+    queueCleanup(old);
   }
   ui["search-progress-panel"].hidden = true;
   ui["results-list"].setAttribute("aria-busy", "false");
@@ -506,7 +559,7 @@ async function pollSearch(run) {
 async function startSearch(event) {
   event.preventDefault();
   const query = ui["scene-query"].value.trim();
-  if (!state.movie || state.upload || state.run || !state.ready || !query) return;
+  if (!state.movie || state.upload || state.run || pendingCleanup.size > 0 || !state.ready || !query) return;
   notice();
   clearResults();
   const run = { generation: state.generation, id: null, cancelRequested: false };
@@ -524,13 +577,24 @@ async function startSearch(event) {
     const data = await request(`/api/movies/${encodeURIComponent(state.movie.id)}/search`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query }) });
     if (typeof data.searchId !== "string" || !data.searchId) throw new Error("Invalid search ID");
     run.id = data.searchId;
-    if (!isCurrent(run)) { deleteSearch(run).catch(() => {}); return; }
+    if (!isCurrent(run)) { queueCleanup(run); return; }
     if (run.cancelRequested) { cancelSearch(run); return; }
     pollSearch(run);
   } catch (error) {
-    if (!isCurrent(run)) return;
+    const rejected = error.status >= 400 && error.status < 500;
+    if (!isCurrent(run)) {
+      if (rejected) pendingCleanup.delete(run);
+      else { run.creationUncertain = true; pendingCleanup.add(run); }
+      updateCleanupNotice();
+      return;
+    }
     finishSearch(run, "Search could not start. You can try again.");
     notice(errorMessage(error, "The scene search could not start."));
+    if (!rejected) {
+      run.creationUncertain = true;
+      queueCleanup(run);
+      resultStatus("Search startup could not be confirmed. See the cancellation message above.");
+    }
   }
 }
 
