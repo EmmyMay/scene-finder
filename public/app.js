@@ -12,7 +12,8 @@ const ui = Object.fromEntries([
   "api-key", "connection-status", "settings-error", "save-connection", "remove-connection",
   "cleanup-notice", "cleanup-message", "retry-cleanup",
   "clip-editor", "clip-duration", "clip-start", "clip-end", "set-clip-start", "set-clip-end",
-  "clip-error", "preview-clip",
+  "clip-error", "preview-clip", "export-clip", "cancel-clip-export", "save-clip",
+  "clip-export-progress", "clip-export-status",
 ].map(id => [id, document.getElementById(id)]));
 
 const state = { generation: 0, movie: null, upload: null, run: null, ready: false, results: [], duration: 0 };
@@ -283,6 +284,7 @@ function detachSearch() {
 
 function resetMovie() {
   stopClipPreview();
+  resetClipExport();
   ui["clip-editor"].hidden = true;
   ui["clip-error"].hidden = true;
   state.generation += 1;
@@ -488,10 +490,14 @@ function clipRange() {
 
 function updateClipControls(showError = false) {
   const range = clipRange();
+  const exporting = Boolean(clip.export);
   ui["clip-duration"].textContent = range ? `${((range.endSeconds - range.startSeconds)).toFixed(3)}s selected` : "";
-  ui["preview-clip"].disabled = !range || player.readyState < 1;
+  ui["preview-clip"].disabled = !range || player.readyState < 1 || exporting;
   ui["preview-clip"].textContent = clip.previewing ? "Stop preview" : "Preview clip";
-  ui["clip-error"].hidden = !showError || Boolean(range);
+  ui["export-clip"].disabled = !range || exporting;
+  ui["cancel-clip-export"].hidden = !exporting;
+  for (const id of ["clip-start", "clip-end", "set-clip-start", "set-clip-end"]) ui[id].disabled = exporting;
+  if (showError) ui["clip-error"].hidden = Boolean(range);
   if (!range && showError) ui["clip-error"].textContent = "Enter valid timecodes with an out point after the in point and within this movie.";
 }
 
@@ -504,13 +510,76 @@ function stopClipPreview() {
 
 function seedClip(result) {
   stopClipPreview();
-  const start = Math.min(result.startSeconds, state.duration);
+  resetClipExport();
+  ui["clip-error"].hidden = true;
   // An initial editable selection gives an isolated sampled hit some playback context.
   // It is a clip choice, not a claim about the detected scene boundary.
-  const end = Math.min(state.duration, Math.max(result.endSeconds, start + 3));
+  const isolated = result.startSeconds === result.endSeconds;
+  const peak = result.peakTimestampSeconds ?? result.startSeconds;
+  const start = Math.min(state.duration, isolated ? Math.max(0, peak - 1.5) : result.startSeconds);
+  const end = Math.min(state.duration, isolated ? peak + 1.5 : result.endSeconds);
   ui["clip-start"].value = clipTime(start);
   ui["clip-end"].value = clipTime(end);
   updateClipControls();
+}
+
+function resetClipExport(message = "") {
+  const old = clip.export;
+  clip.export = null;
+  old?.controller.abort();
+  if (clip.downloadUrl) URL.revokeObjectURL(clip.downloadUrl);
+  clip.downloadUrl = null;
+  ui["save-clip"].removeAttribute("href");
+  ui["save-clip"].hidden = true;
+  ui["clip-export-progress"].hidden = true;
+  ui["clip-export-status"].textContent = message;
+  ui["clip-export-status"].hidden = !message;
+}
+
+async function exportClip() {
+  const range = clipRange();
+  if (!range || clip.export) { updateClipControls(true); return; }
+  stopClipPreview();
+  resetClipExport();
+  const job = { controller: new AbortController(), generation: state.generation };
+  clip.export = job;
+  ui["clip-error"].hidden = true;
+  const current = () => clip.export === job && job.generation === state.generation;
+  ui["clip-export-progress"].hidden = false;
+  ui["clip-export-status"].textContent = "Preparing your MP4 clip…";
+  ui["clip-export-status"].hidden = false;
+  updateClipControls();
+  try {
+    const response = await fetch(`/api/movies/${encodeURIComponent(state.movie.id)}/clips`, {
+      method: "POST", headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(range), signal: job.controller.signal,
+    });
+    if (!response.ok) {
+      const error = new Error("Clip export failed");
+      error.status = response.status;
+      try { error.code = (await response.json()).error?.code; } catch { /* Use the safe fallback below. */ }
+      throw error;
+    }
+    const blob = await response.blob();
+    if (!current()) return;
+    if (blob.size === 0 || blob.type.split(";")[0] !== "video/mp4") throw new Error("Invalid clip response");
+    clip.downloadUrl = URL.createObjectURL(blob);
+    ui["save-clip"].href = clip.downloadUrl;
+    ui["save-clip"].download = `scene-${range.startSeconds.toFixed(3)}-${range.endSeconds.toFixed(3)}.mp4`;
+    ui["save-clip"].hidden = false;
+    ui["clip-export-status"].textContent = "Your clip is ready. Choose Save MP4 to save it.";
+  } catch (error) {
+    if (!current()) return;
+    ui["clip-export-status"].textContent = "Clip export could not finish. Try again.";
+    ui["clip-error"].textContent = error.status === 400 ? "The clip range could not be exported. Check the in and out points and try again." : errorMessage(error, "The MP4 clip could not be exported.");
+    ui["clip-error"].hidden = false;
+  } finally {
+    if (current()) {
+      clip.export = null;
+      ui["clip-export-progress"].hidden = true;
+      updateClipControls();
+    }
+  }
 }
 
 async function previewClip() {
@@ -531,16 +600,19 @@ async function previewClip() {
 }
 
 for (const id of ["clip-start", "clip-end"]) {
-  ui[id].addEventListener("input", () => { stopClipPreview(); updateClipControls(); });
+  ui[id].addEventListener("input", () => { stopClipPreview(); resetClipExport(); ui["clip-error"].hidden = true; updateClipControls(); });
   ui[id].addEventListener("change", () => updateClipControls(true));
 }
 for (const boundary of ["start", "end"]) ui[`set-clip-${boundary}`].addEventListener("click", () => {
   if (!state.movie || player.readyState < 1) return;
   stopClipPreview();
+  resetClipExport();
   ui[`clip-${boundary}`].value = clipTime(Math.min(player.currentTime, state.duration));
   updateClipControls(true);
 });
 ui["preview-clip"].addEventListener("click", previewClip);
+ui["export-clip"].addEventListener("click", exportClip);
+ui["cancel-clip-export"].addEventListener("click", () => { resetClipExport("Clip export cancelled."); updateClipControls(); });
 player.addEventListener("pause", () => { clip.previewing = false; updateClipControls(); });
 
 function renderResults(results, step) {

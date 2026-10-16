@@ -68,7 +68,14 @@
             </div>
             <p id="clip-time-hint" class="field-hint">Hours:minutes:seconds.milliseconds · end must be after start.</p>
             <p id="clip-error" class="settings-error" role="alert" hidden></p>
-            <button id="preview-clip" class="button button-secondary" type="button" disabled>Preview clip</button>
+            <div class="clip-actions">
+              <button id="preview-clip" class="button button-secondary" type="button" disabled>Preview clip</button>
+              <button id="export-clip" class="button button-secondary" type="button" disabled>Export MP4</button>
+              <button id="cancel-clip-export" class="text-button" type="button" hidden>Cancel export</button>
+              <a id="save-clip" class="button button-primary" hidden>Save MP4 <span aria-hidden="true">↓</span></a>
+            </div>
+            <progress id="clip-export-progress" aria-label="Clip export progress" hidden></progress>
+            <p id="clip-export-status" class="field-hint" role="status" hidden></p>
           </section>
         </section>
 
