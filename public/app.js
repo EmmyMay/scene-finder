@@ -162,7 +162,10 @@ async function refreshConnection() {
     connection.configured = settings.configured === true;
     connection.loading = settings.loading === true;
     connection.loaded = true;
-    if (connection.readError) settingsError();
+    if (typeof settings.error === "string" && settings.error) {
+      settingsError(settings.error);
+      connection.readError = true;
+    } else if (connection.readError) settingsError();
     ui["connection-status"].textContent = connectionLabel();
   } catch (error) {
     connection.loading = false;
