@@ -102,11 +102,6 @@ h2 em { font-size: 1.12em; letter-spacing: -.025em; }
 .key-note { max-width: 680px; margin: 0 auto; font-size: 12px; color: var(--muted); line-height: 1.9; }
 .key-note strong { font-weight: 500; color: var(--ink); }
 .key-note a { white-space: nowrap; }
-.beta-details { display: flex; gap: 20px; max-width: 760px; text-align: left; margin: 26px auto 0; padding-top: 24px; border-top: 1px solid var(--line); align-items: flex-start; }
-.beta-label { flex-shrink: 0; font: 9px/1.6 var(--mono); letter-spacing: .5px; padding: 4px 7px; border: 1px solid var(--line); border-radius: 4px; color: var(--muted); }
-.beta-details p { font-size: 11px; line-height: 1.8; color: var(--muted); }
-.linux-note { font-size: 11px; color: var(--muted); margin-top: 28px; }
-.linux-note > span { display: block; font-size: 10px; margin-top: 4px; }
 .faq { display: grid; grid-template-columns: .9fr 1.1fr; gap: 60px; padding-block: 80px 115px; border-top: 1px solid var(--line); }
 .questions details { border-bottom: 1px solid var(--line); }
 .questions details:first-child { border-top: 1px solid var(--line); }
@@ -183,7 +178,6 @@ footer { padding-bottom: 30px; }
   .download-option > svg { margin-bottom: 10px; }
   .download-option .button { margin-top: 20px; }
   .key-note { text-align: left; font-size: 11px; }
-  .beta-details { flex-direction: column; gap: 10px; margin-top: 22px; }
   .faq { grid-template-columns: 1fr; gap: 32px; padding-block: 60px 70px; }
   .footer-main { gap: 17px; }
   .footer-main > p { display: none; }
