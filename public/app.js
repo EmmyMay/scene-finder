@@ -13,7 +13,7 @@ const ui = Object.fromEntries([
   "cleanup-notice", "cleanup-message", "retry-cleanup",
   "clip-editor", "clip-duration", "clip-start", "clip-end", "set-clip-start", "set-clip-end",
   "clip-error", "preview-clip", "export-clip", "cancel-clip-export", "save-clip",
-  "clip-export-progress", "clip-export-status",
+  "clip-export-progress", "clip-export-status", "query-shortcut",
 ].map(id => [id, document.getElementById(id)]));
 
 const state = { generation: 0, movie: null, upload: null, run: null, ready: false, results: [], duration: 0 };
@@ -302,7 +302,7 @@ function resetMovie() {
   ui["upload-state"].hidden = true;
   ui["replace-movie"].hidden = true;
   ui["movie-name"].textContent = "No movie selected";
-  ui["movie-details"].textContent = "—";
+  ui["movie-details"].textContent = "MKV and MP4 supported";
   ui["timeline"].disabled = true;
   ui["timeline"].value = "0";
   ui["timeline-end"].textContent = "—";
@@ -379,7 +379,7 @@ function uploadMovie(file) {
     player.src = source;
     player.load();
     ui["movie-name"].textContent = movie.name || file.name;
-    ui["movie-details"].textContent = movie.width && movie.height ? `${movie.width} × ${movie.height}` : "";
+    ui["movie-details"].textContent = [timecode(movie.durationSeconds), movie.width && movie.height ? `${movie.width} × ${movie.height}` : ""].filter(Boolean).join(" · ");
     ui["timeline-end"].textContent = timecode(state.duration);
     ui["playback-time"].textContent = `00:00 / ${timecode(state.duration)}`;
     seedClip({ startSeconds: 0, endSeconds: Math.min(5, state.duration) });
@@ -767,6 +767,15 @@ ui["movie-file"].addEventListener("change", event => { uploadMovie(event.target.
 ui["cancel-upload"].addEventListener("click", () => { resetMovie(); resultStatus("Upload cancelled. Choose a movie when you’re ready."); });
 ui["search-form"].addEventListener("submit", startSearch);
 ui["scene-query"].addEventListener("input", updateControls);
+const platform = globalThis.navigator?.userAgentData?.platform || globalThis.navigator?.platform || "";
+ui["query-shortcut"].textContent = /mac|iphone|ipad/i.test(platform) ? "⌘ Enter" : "Ctrl Enter";
+ui["query-shortcut"].hidden = false;
+ui["scene-query"].addEventListener("keydown", event => {
+  if ((event.metaKey || event.ctrlKey) && event.key === "Enter" && !event.isComposing && !event.repeat && !ui["search-button"].disabled) {
+    event.preventDefault();
+    ui["search-form"].requestSubmit();
+  }
+});
 ui["cancel-search"].addEventListener("click", () => cancelSearch());
 
 let dragDepth = 0;
