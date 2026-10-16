@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta name="theme-color" content="#F6F7FA">
+    <title>Scene Finder</title>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;500;600&family=Source+Sans+3:wght@400;500;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to workspace</a>
+    <header class="app-toolbar">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><rect x="3" y="5" width="26" height="22" rx="6" fill="currentColor"/><path d="M10 5v22M22 5v22M3 12h7M3 20h7M22 12h7M22 20h7" stroke="#F6F7FA" stroke-width="1.5"/><path d="m14 12 6 4-6 4z" fill="#F6F7FA"/></svg>
+        <h1>Scene Finder</h1>
+      </div>
+      <button id="settings-button" class="settings-button" type="button" title="Connection settings" disabled>
+        <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3" fill="#F6F7FA"/><circle cx="16" cy="17" r="3" fill="#F6F7FA"/></svg>
+        Settings
+      </button>
+    </header>
+
+    <main id="workspace">
+      <div id="setup-notice" class="notice" role="status" hidden></div>
+      <div id="error-notice" class="notice notice-error" role="alert" hidden></div>
+
+      <div class="workspace-grid">
+        <section class="movie-panel" aria-labelledby="movie-heading">
+          <div class="panel-heading"><h2 id="movie-heading">Your movie</h2><button id="replace-movie" class="text-button" type="button" hidden>Change movie <span aria-hidden="true">↗</span></button></div>
+          <input id="movie-file" type="file" accept="video/*,.mkv,.mov,.mp4,.webm,.avi" hidden>
+          <div id="drop-zone" class="player-stage">
+            <video id="movie-player" controls playsinline preload="metadata" aria-label="Your uploaded movie" hidden></video>
+            <div id="upload-empty" class="upload-empty">
+              <svg class="upload-symbol" viewBox="0 0 64 64" width="64" height="64" aria-hidden="true"><rect x="9" y="8" width="46" height="48" rx="10" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M20 8v48M44 8v48M9 21h11M9 43h11M44 21h11M44 43h11M27 27l10 6-10 6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+              <h3>Choose your movie</h3>
+              <p>Drop a video here, or choose a file.</p>
+              <button id="choose-movie" class="button button-light" type="button">Choose a movie <span aria-hidden="true">↑</span></button>
+              <span class="upload-hint">Video files · MP4 recommended for playback</span>
+            </div>
+            <div id="upload-state" class="upload-state" hidden>
+              <p class="eyebrow">BRINGING IN YOUR MOVIE</p><h3 id="upload-name"></h3>
+              <div class="progress-heading"><span id="upload-label" role="status">Uploading movie…</span><span id="upload-percent" class="timecode"></span></div>
+              <progress id="upload-progress" max="100" value="0" aria-label="Movie upload progress"></progress>
+              <button id="cancel-upload" class="text-button" type="button">Cancel upload</button>
+            </div>
+            <div class="drop-hint" aria-hidden="true">Drop to change movie</div>
+          </div>
+          <div class="movie-meta"><span id="movie-name">No movie selected</span><span id="movie-details" class="timecode">—</span></div>
+
+          <section class="timeline-panel" aria-labelledby="timeline-heading">
+            <div class="timeline-heading"><h3 id="timeline-heading">The timeline</h3><span id="playback-time" class="timecode">00:00 / 00:00</span></div>
+            <div class="timeline-track"><div id="timeline-markers" class="timeline-markers"></div><input id="timeline" type="range" min="0" max="1" step="0.1" value="0" aria-label="Seek within movie" disabled></div>
+            <div class="timeline-labels"><span class="timecode">00:00</span><span id="timeline-end" class="timecode">—</span></div>
+            <div id="contact-empty" class="contact-empty"><span class="contact-line" aria-hidden="true"></span><p>Matching frames appear here after a search.</p></div>
+            <div id="contact-strip" class="contact-strip" role="group" aria-label="Matching frames, in movie order" hidden></div>
+          </section>
+        </section>
+
+        <aside class="search-panel" aria-labelledby="search-heading">
+          <div class="panel-heading"><h2 id="search-heading">Find a scene</h2><span class="small-label">IN THIS MOVIE</span></div>
+          <form id="search-form">
+            <label for="scene-query">What do you remember?</label>
+            <textarea id="scene-query" rows="4" maxlength="2000" placeholder="A person waiting under a streetlight in the rain…" aria-describedby="query-hint" required disabled></textarea>
+            <p id="query-hint" class="field-hint">Describe what you can see: people, places, actions, or colors.</p>
+            <button id="search-button" class="button button-primary" type="submit" disabled><span>Find the scene</span><svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+          </form>
+          <div id="search-progress-panel" class="search-progress-panel" hidden>
+            <div class="progress-heading"><span id="search-phase" role="status">Preparing search…</span><button id="cancel-search" class="text-button" type="button">Cancel</button></div>
+            <progress id="search-progress" aria-label="Scene search progress"></progress>
+            <p id="search-count" class="field-hint">Waiting to begin</p>
+          </div>
+          <section class="results-panel" aria-labelledby="results-heading">
+            <div class="results-heading"><h3 id="results-heading">Matching moments</h3><span id="results-count" class="result-count" hidden></span></div>
+            <p id="results-status" class="results-status" role="status">Choose a movie to get started.</p>
+            <div id="results-list" class="results-list"></div>
+            <p id="sample-note" class="sample-note" hidden></p>
+          </section>
+        </aside>
+      </div>
+    </main>
+    <noscript><p class="notice">Enable JavaScript to upload a movie and find scenes.</p></noscript>
+  </body>
+</html>
