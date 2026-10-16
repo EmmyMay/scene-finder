@@ -739,10 +739,15 @@ export function createApp(options: BackendServerOptions = {}): {
 
     const cacheKey = `${movie.id}:${job.sampleStepSeconds}`;
     let entry = frameExtractionLocks.get(cacheKey);
+    if (entry && entry.abortController.signal.aborted) {
+      frameExtractionLocks.delete(cacheKey);
+      entry = undefined;
+    }
 
     if (!entry) {
       const sharedAbortController = new AbortController();
       const consumers = new Set<AbortSignal>();
+      let createdEntry: SharedExtractionEntry | undefined;
       const promise = extractSampledFrames({
         moviePath: movie.filePath,
         outputDir: job.framesDir,
@@ -754,15 +759,18 @@ export function createApp(options: BackendServerOptions = {}): {
         ffmpegBin,
         signal: sharedAbortController.signal
       }).finally(() => {
-        frameExtractionLocks.delete(cacheKey);
+        if (frameExtractionLocks.get(cacheKey) === createdEntry) {
+          frameExtractionLocks.delete(cacheKey);
+        }
       });
 
-      entry = {
+      createdEntry = {
         abortController: sharedAbortController,
         consumers,
         promise
       };
-      frameExtractionLocks.set(cacheKey, entry);
+      entry = createdEntry;
+      frameExtractionLocks.set(cacheKey, createdEntry);
     }
 
     const currentEntry = entry;
@@ -772,6 +780,9 @@ export function createApp(options: BackendServerOptions = {}): {
       const onConsumerAbort = (): void => {
         currentEntry.consumers.delete(consumerSignal);
         if (currentEntry.consumers.size === 0) {
+          if (frameExtractionLocks.get(cacheKey) === currentEntry) {
+            frameExtractionLocks.delete(cacheKey);
+          }
           currentEntry.abortController.abort();
         }
         const abortErr = new Error("Operation cancelled");
