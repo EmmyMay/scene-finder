@@ -2,7 +2,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import http from "node:http";
-import type { AddressInfo } from "node:net";
+import type { AddressInfo, Socket } from "node:net";
 import path from "node:path";
 import express, { type NextFunction, type Request, type Response } from "express";
 import multer from "multer";
@@ -13,6 +13,7 @@ import {
   chooseSampleStepSeconds,
   exportMovieClip,
   extractSampledFrames,
+  moveFileCrossDevice,
   preparePlayableMovie,
   probeVideoFile
 } from "./media.js";
@@ -44,6 +45,7 @@ export interface BackendServerOptions {
   ffmpegBin?: string;
   ffprobePath?: string;
   ffprobeBin?: string;
+  maxUploadBytes?: number;
   windowSize?: number;
   matchThreshold?: number;
   jevScorer?: JevScorer;
@@ -90,6 +92,7 @@ function sanitizeAttachmentStem(name: string): string {
 export function createApp(options: BackendServerOptions = {}): {
   app: express.Express;
   cancelAllSearches(): void;
+  waitForActiveOperations(): Promise<void>;
 } {
   const baseConfig = resolveConfig({
     apiKey: options.apiKey,
@@ -129,6 +132,13 @@ export function createApp(options: BackendServerOptions = {}): {
     options.ffprobePath ?? options.ffprobeBin ?? process.env.FFPROBE_PATH ?? "ffprobe";
   const publicDir = options.publicDir ?? path.resolve(process.cwd(), "public");
   const apiToken = options.apiToken?.trim() || "";
+  const parsedMaxUpload = Number(
+    options.maxUploadBytes ?? process.env.MAX_UPLOAD_BYTES ?? 2 * 1024 * 1024 * 1024
+  );
+  const maxUploadBytes =
+    Number.isFinite(parsedMaxUpload) && parsedMaxUpload > 0
+      ? Math.floor(parsedMaxUpload)
+      : 2 * 1024 * 1024 * 1024;
 
   const uploadsTmpDir = path.join(baseConfig.dataDir, "tmp");
   const clipsTmpDir = path.join(baseConfig.dataDir, "clips");
@@ -151,6 +161,28 @@ export function createApp(options: BackendServerOptions = {}): {
   const searches = new Map<string, InternalSearchJob>();
   const activePrepareControllers = new Set<AbortController>();
   const activeClipControllers = new Set<AbortController>();
+  const activeStreams = new Set<fs.ReadStream>();
+  const inFlightOperations = new Set<Promise<unknown>>();
+  const frameExtractionLocks = new Map<string, Promise<ExtractedFrame[]>>();
+
+  function trackOperation<T>(promise: Promise<T>): Promise<T> {
+    const tracked = promise.finally(() => {
+      inFlightOperations.delete(tracked);
+    });
+    inFlightOperations.add(tracked);
+    return promise;
+  }
+
+  function trackReadStream(stream: fs.ReadStream): fs.ReadStream {
+    activeStreams.add(stream);
+    const cleanup = (): void => {
+      activeStreams.delete(stream);
+    };
+    stream.once("close", cleanup);
+    stream.once("end", cleanup);
+    stream.once("error", cleanup);
+    return stream;
+  }
 
   const upload = multer({
     storage: multer.diskStorage({
@@ -158,20 +190,28 @@ export function createApp(options: BackendServerOptions = {}): {
         fs.mkdirSync(uploadsTmpDir, { recursive: true });
         cb(null, uploadsTmpDir);
       },
-      filename: (_req, file, cb) => {
+      filename: (req, file, cb) => {
         const ext = path.extname(file.originalname || "") || ".bin";
-        cb(null, `upload_${crypto.randomUUID()}${ext}`);
+        const tempName = `upload_${crypto.randomUUID()}${ext}`;
+        (req as Request & { _tempUploadPath?: string })._tempUploadPath = path.join(
+          uploadsTmpDir,
+          tempName
+        );
+        cb(null, tempName);
       }
     }),
     limits: {
-      files: 1
+      fileSize: maxUploadBytes,
+      files: 1,
+      fields: 5,
+      parts: 6,
+      fieldSize: 16 * 1024
     }
   });
 
   const app = express();
   app.disable("x-powered-by");
 
-  // Optional desktop loopback token check on all /api routes
   app.use("/api", (req: Request, res: Response, next: NextFunction) => {
     if (!apiToken) {
       next();
@@ -212,7 +252,6 @@ export function createApp(options: BackendServerOptions = {}): {
 
   // POST /api/movies
   app.post("/api/movies", (req: Request, res: Response, next: NextFunction) => {
-    // Replacing an in-flight upload preparation stops the previous preparation immediately
     for (const prevController of activePrepareControllers) {
       prevController.abort();
     }
@@ -229,126 +268,149 @@ export function createApp(options: BackendServerOptions = {}): {
     req.on("aborted", onDisconnect);
     res.on("close", onDisconnect);
 
-    upload.single("file")(req, res, async (uploadErr: unknown) => {
-      const cleanupController = (): void => {
-        req.removeListener("aborted", onDisconnect);
-        res.removeListener("close", onDisconnect);
-        activePrepareControllers.delete(prepAbortController);
-      };
+    upload.single("file")(req, res, (uploadErr: unknown) => {
+      void trackOperation(
+        (async () => {
+          const tempUploadPath =
+            req.file?.path ?? (req as Request & { _tempUploadPath?: string })._tempUploadPath;
 
-      if (uploadErr) {
-        cleanupController();
-        if (prepAbortController.signal.aborted) {
-          return;
-        }
-        const msg =
-          uploadErr instanceof Error ? uploadErr.message : "Failed to parse multipart upload.";
-        res.status(400).json({
-          error: {
-            code: "INVALID_UPLOAD",
-            message: redactSecrets(msg, [getCurrentApiKey(), apiToken])
-          }
-        });
-        return;
-      }
+          const cleanupController = (): void => {
+            req.removeListener("aborted", onDisconnect);
+            res.removeListener("close", onDisconnect);
+            activePrepareControllers.delete(prepAbortController);
+          };
 
-      const file = req.file;
-      if (!file) {
-        cleanupController();
-        if (prepAbortController.signal.aborted) {
-          return;
-        }
-        res.status(400).json({
-          error: {
-            code: "MISSING_FILE",
-            message: "Multipart field 'file' is required."
-          }
-        });
-        return;
-      }
-
-      const movieId = `mov_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-      const movieDir = path.join(moviesBaseDir, movieId);
-
-      try {
-        const initialProbed = await probeVideoFile(
-          file.path,
-          ffprobeBin,
-          prepAbortController.signal
-        );
-
-        await fsp.mkdir(movieDir, { recursive: true });
-        const originalName = path.basename(file.originalname || "movie.mp4");
-        const ext = path.extname(originalName) || ".mp4";
-        const sourcePath = path.join(movieDir, `source${ext}`);
-        await fsp.rename(file.path, sourcePath);
-
-        const playableTargetPath = path.join(movieDir, "playable.mp4");
-        const prepared = await preparePlayableMovie({
-          sourcePath,
-          playableOutputPath: playableTargetPath,
-          probed: initialProbed,
-          ffmpegBin,
-          ffprobeBin,
-          signal: prepAbortController.signal
-        });
-
-        cleanupController();
-        if (prepAbortController.signal.aborted) {
-          await fsp.rm(movieDir, { recursive: true, force: true }).catch(() => undefined);
-          return;
-        }
-
-        const record: MovieRecord = {
-          id: movieId,
-          name: originalName,
-          durationSeconds: prepared.probed.durationSeconds,
-          width: prepared.probed.width,
-          height: prepared.probed.height,
-          mediaUrl: `/api/movies/${movieId}/media`,
-          sourceFilePath: sourcePath,
-          filePath: prepared.playablePath,
-          mimeType: "video/mp4",
-          hasAudio: prepared.probed.hasAudio
-        };
-
-        movies.set(movieId, record);
-
-        res.status(201).json({
-          movie: {
-            id: record.id,
-            name: record.name,
-            durationSeconds: record.durationSeconds,
-            width: record.width,
-            height: record.height,
-            mediaUrl: record.mediaUrl
-          }
-        });
-      } catch (err) {
-        cleanupController();
-        await fsp.unlink(file.path).catch(() => undefined);
-        await fsp.rm(movieDir, { recursive: true, force: true }).catch(() => undefined);
-
-        if (
-          prepAbortController.signal.aborted ||
-          (err instanceof Error && err.name === "AbortError")
-        ) {
-          if (!res.headersSent && !res.writableEnded) {
-            res.status(499).json({
+          if (uploadErr) {
+            cleanupController();
+            if (tempUploadPath) {
+              await fsp.unlink(tempUploadPath).catch(() => undefined);
+            }
+            if (prepAbortController.signal.aborted) {
+              return;
+            }
+            const multerCode = (uploadErr as { code?: string } | undefined)?.code;
+            if (multerCode === "LIMIT_FILE_SIZE") {
+              res.status(413).json({
+                error: {
+                  code: "UPLOAD_TOO_LARGE",
+                  message: `Uploaded file exceeds maximum allowed size of ${maxUploadBytes} bytes.`
+                }
+              });
+              return;
+            }
+            const msg =
+              uploadErr instanceof Error ? uploadErr.message : "Failed to parse multipart upload.";
+            res.status(400).json({
               error: {
-                code: "UPLOAD_CANCELLED",
-                message: "Movie upload or playback preparation was cancelled."
+                code: "INVALID_UPLOAD",
+                message: redactSecrets(msg, [getCurrentApiKey(), apiToken])
               }
             });
+            return;
           }
-          return;
-        }
-        next(err);
-      }
+
+          const file = req.file;
+          if (!file) {
+            cleanupController();
+            if (tempUploadPath) {
+              await fsp.unlink(tempUploadPath).catch(() => undefined);
+            }
+            if (prepAbortController.signal.aborted) {
+              return;
+            }
+            res.status(400).json({
+              error: {
+                code: "MISSING_FILE",
+                message: "Multipart field 'file' is required."
+              }
+            });
+            return;
+          }
+
+          const movieId = `mov_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+          const movieDir = path.join(moviesBaseDir, movieId);
+
+          try {
+            const initialProbed = await probeVideoFile(
+              file.path,
+              ffprobeBin,
+              prepAbortController.signal
+            );
+
+            await fsp.mkdir(movieDir, { recursive: true });
+            const originalName = path.basename(file.originalname || "movie.mp4");
+            const ext = path.extname(originalName) || ".mp4";
+            const sourcePath = path.join(movieDir, `source${ext}`);
+            await moveFileCrossDevice(file.path, sourcePath);
+
+            const playableTargetPath = path.join(movieDir, "playable.mp4");
+            const prepared = await preparePlayableMovie({
+              sourcePath,
+              playableOutputPath: playableTargetPath,
+              probed: initialProbed,
+              ffmpegBin,
+              ffprobeBin,
+              signal: prepAbortController.signal
+            });
+
+            cleanupController();
+            if (prepAbortController.signal.aborted) {
+              await fsp.rm(movieDir, { recursive: true, force: true }).catch(() => undefined);
+              return;
+            }
+
+            const record: MovieRecord = {
+              id: movieId,
+              name: originalName,
+              durationSeconds: prepared.probed.durationSeconds,
+              width: prepared.probed.width,
+              height: prepared.probed.height,
+              mediaUrl: `/api/movies/${movieId}/media`,
+              sourceFilePath: sourcePath,
+              filePath: prepared.playablePath,
+              mimeType: "video/mp4",
+              hasAudio: prepared.probed.hasAudio
+            };
+
+            movies.set(movieId, record);
+
+            res.status(201).json({
+              movie: {
+                id: record.id,
+                name: record.name,
+                durationSeconds: record.durationSeconds,
+                width: record.width,
+                height: record.height,
+                mediaUrl: record.mediaUrl
+              }
+            });
+          } catch (err) {
+            cleanupController();
+            await fsp.unlink(file.path).catch(() => undefined);
+            await fsp.rm(movieDir, { recursive: true, force: true }).catch(() => undefined);
+
+            if (
+              prepAbortController.signal.aborted ||
+              (err instanceof Error && err.name === "AbortError")
+            ) {
+              if (!res.headersSent && !res.writableEnded) {
+                res.status(499).json({
+                  error: {
+                    code: "UPLOAD_CANCELLED",
+                    message: "Movie upload or playback preparation was cancelled."
+                  }
+                });
+              }
+              return;
+            }
+            next(err);
+          }
+        })()
+      );
     });
   });
 
-  // GET /api/movies/:id/media (supports HTTP Range requests for video seeking)
+  // GET /api/movies/:id/media
   app.get("/api/movies/:id/media", async (req: Request, res: Response, next: NextFunction) => {
     try {
       const movieId = String(req.params.id ?? "");
@@ -377,8 +439,13 @@ export function createApp(options: BackendServerOptions = {}): {
           res.end();
           return;
         }
-        const stream = fs.createReadStream(movie.filePath);
-        stream.on("error", next);
+        const stream = trackReadStream(fs.createReadStream(movie.filePath));
+        req.once("close", () => stream.destroy());
+        stream.on("error", (err) => {
+          if (!res.headersSent) {
+            next(err);
+          }
+        });
         stream.pipe(res);
         return;
       }
@@ -431,8 +498,13 @@ export function createApp(options: BackendServerOptions = {}): {
         return;
       }
 
-      const stream = fs.createReadStream(movie.filePath, { start, end });
-      stream.on("error", next);
+      const stream = trackReadStream(fs.createReadStream(movie.filePath, { start, end }));
+      req.once("close", () => stream.destroy());
+      stream.on("error", (err) => {
+        if (!res.headersSent) {
+          next(err);
+        }
+      });
       stream.pipe(res);
     } catch (err) {
       next(err);
@@ -440,159 +512,200 @@ export function createApp(options: BackendServerOptions = {}): {
   });
 
   // POST /api/movies/:id/clips
-  app.post("/api/movies/:id/clips", async (req: Request, res: Response, next: NextFunction) => {
-    const movieId = String(req.params.id ?? "");
-    const movie = movies.get(movieId);
-    if (!movie || !fs.existsSync(movie.filePath)) {
-      res.status(404).json({
-        error: {
-          code: "MOVIE_NOT_FOUND",
-          message: "Movie not found."
+  app.post("/api/movies/:id/clips", (req: Request, res: Response, next: NextFunction) => {
+    void trackOperation(
+      (async () => {
+        const movieId = String(req.params.id ?? "");
+        const movie = movies.get(movieId);
+        if (!movie || !fs.existsSync(movie.filePath)) {
+          res.status(404).json({
+            error: {
+              code: "MOVIE_NOT_FOUND",
+              message: "Movie not found."
+            }
+          });
+          return;
         }
-      });
-      return;
-    }
 
-    const startSeconds = req.body?.startSeconds;
-    const endSeconds = req.body?.endSeconds;
+        const startSeconds = req.body?.startSeconds;
+        const endSeconds = req.body?.endSeconds;
 
-    if (
-      typeof startSeconds !== "number" ||
-      !Number.isFinite(startSeconds) ||
-      typeof endSeconds !== "number" ||
-      !Number.isFinite(endSeconds) ||
-      startSeconds < 0 ||
-      startSeconds >= endSeconds ||
-      endSeconds > movie.durationSeconds
-    ) {
-      res.status(400).json({
-        error: {
-          code: "INVALID_CLIP_RANGE",
-          message: `Clip range must satisfy 0 <= startSeconds < endSeconds <= ${movie.durationSeconds}.`
+        if (
+          typeof startSeconds !== "number" ||
+          !Number.isFinite(startSeconds) ||
+          typeof endSeconds !== "number" ||
+          !Number.isFinite(endSeconds) ||
+          startSeconds < 0 ||
+          startSeconds >= endSeconds ||
+          endSeconds > movie.durationSeconds
+        ) {
+          res.status(400).json({
+            error: {
+              code: "INVALID_CLIP_RANGE",
+              message: `Clip range must satisfy 0 <= startSeconds < endSeconds <= ${movie.durationSeconds}.`
+            }
+          });
+          return;
         }
-      });
-      return;
-    }
 
-    const clipAbortController = new AbortController();
-    activeClipControllers.add(clipAbortController);
-    const outputClipPath = path.join(clipsTmpDir, `clip_${crypto.randomUUID()}.mp4`);
+        const clipAbortController = new AbortController();
+        activeClipControllers.add(clipAbortController);
+        const outputClipPath = path.join(clipsTmpDir, `clip_${crypto.randomUUID()}.mp4`);
 
-    const onDisconnect = (): void => {
-      if (!res.writableEnded) {
-        clipAbortController.abort();
-      }
-    };
-    req.on("aborted", onDisconnect);
-    res.on("close", onDisconnect);
+        const onDisconnect = (): void => {
+          if (!res.writableEnded) {
+            clipAbortController.abort();
+          }
+        };
+        req.on("aborted", onDisconnect);
+        res.on("close", onDisconnect);
 
-    const cleanupClip = async (): Promise<void> => {
-      req.removeListener("aborted", onDisconnect);
-      res.removeListener("close", onDisconnect);
-      activeClipControllers.delete(clipAbortController);
-      await fsp.unlink(outputClipPath).catch(() => undefined);
-    };
+        const cleanupClip = async (): Promise<void> => {
+          req.removeListener("aborted", onDisconnect);
+          res.removeListener("close", onDisconnect);
+          activeClipControllers.delete(clipAbortController);
+          await fsp.unlink(outputClipPath).catch(() => undefined);
+        };
 
+        try {
+          await exportMovieClip({
+            playableMoviePath: movie.filePath,
+            outputClipPath,
+            startSeconds,
+            endSeconds,
+            ffmpegBin,
+            signal: clipAbortController.signal
+          });
+
+          if (clipAbortController.signal.aborted) {
+            await cleanupClip();
+            return;
+          }
+
+          const stat = await fsp.stat(outputClipPath);
+          const stem = sanitizeAttachmentStem(movie.name);
+          const startLabel = roundTimestamp(startSeconds).toFixed(2).replace(/\.?0+$/, "");
+          const endLabel = roundTimestamp(endSeconds).toFixed(2).replace(/\.?0+$/, "");
+          const downloadFileName = `${stem}-${startLabel}s-${endLabel}s.mp4`;
+
+          res.status(200);
+          res.setHeader("Content-Type", "video/mp4");
+          res.setHeader("Content-Disposition", `attachment; filename="${downloadFileName}"`);
+          res.setHeader("Content-Length", String(stat.size));
+
+          await new Promise<void>((resolve, reject) => {
+            const stream = trackReadStream(fs.createReadStream(outputClipPath));
+            req.once("close", () => stream.destroy());
+            stream.on("error", reject);
+            res.on("close", () => resolve());
+            res.on("finish", () => resolve());
+            stream.pipe(res);
+          });
+
+          await cleanupClip();
+        } catch (err) {
+          await cleanupClip();
+          if (
+            clipAbortController.signal.aborted ||
+            (err instanceof Error && err.name === "AbortError")
+          ) {
+            return;
+          }
+          next(err);
+        }
+      })()
+    );
+  });
+
+  // POST /api/movies/:id/search
+  app.post("/api/movies/:id/search", (req: Request, res: Response, next: NextFunction) => {
     try {
-      await exportMovieClip({
-        playableMoviePath: movie.filePath,
-        outputClipPath,
-        startSeconds,
-        endSeconds,
-        ffmpegBin,
-        signal: clipAbortController.signal
-      });
-
-      if (clipAbortController.signal.aborted) {
-        await cleanupClip();
+      const movieId = String(req.params.id ?? "");
+      const movie = movies.get(movieId);
+      if (!movie) {
+        res.status(404).json({
+          error: {
+            code: "MOVIE_NOT_FOUND",
+            message: "Movie not found."
+          }
+        });
         return;
       }
 
-      const stat = await fsp.stat(outputClipPath);
-      const stem = sanitizeAttachmentStem(movie.name);
-      const startLabel = roundTimestamp(startSeconds).toFixed(2).replace(/\.?0+$/, "");
-      const endLabel = roundTimestamp(endSeconds).toFixed(2).replace(/\.?0+$/, "");
-      const downloadFileName = `${stem}-${startLabel}s-${endLabel}s.mp4`;
+      const rawQuery = req.body?.query;
+      if (typeof rawQuery !== "string" || rawQuery.trim().length === 0) {
+        res.status(400).json({
+          error: {
+            code: "INVALID_QUERY",
+            message: "A non-empty scene description query is required."
+          }
+        });
+        return;
+      }
 
-      res.status(200);
-      res.setHeader("Content-Type", "video/mp4");
-      res.setHeader("Content-Disposition", `attachment; filename="${downloadFileName}"`);
-      res.setHeader("Content-Length", String(stat.size));
+      const query = rawQuery.trim();
+      const sampleStepSeconds = chooseSampleStepSeconds(
+        movie.durationSeconds,
+        req.body?.sampleStepSeconds
+      );
 
-      await new Promise<void>((resolve, reject) => {
-        const stream = fs.createReadStream(outputClipPath);
-        stream.on("error", reject);
-        res.on("close", () => resolve());
-        res.on("finish", () => resolve());
-        stream.pipe(res);
-      });
+      const searchId = `srch_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      // Reuse extracted frames per (movieId, sampleStepSeconds)
+      const framesDir = path.join(
+        moviesBaseDir,
+        movie.id,
+        `frames_step_${String(sampleStepSeconds).replace(".", "_")}`
+      );
+      const abortController = new AbortController();
 
-      await cleanupClip();
+      const job: InternalSearchJob = {
+        id: searchId,
+        movieId: movie.id,
+        query,
+        status: "queued",
+        processed: 0,
+        total: 0,
+        sampleStepSeconds,
+        results: [],
+        framesDir,
+        abortController
+      };
+
+      searches.set(searchId, job);
+
+      void trackOperation(runSearchPipeline(job, movie));
+
+      res.status(202).json({ searchId });
     } catch (err) {
-      await cleanupClip();
-      if (
-        clipAbortController.signal.aborted ||
-        (err instanceof Error && err.name === "AbortError")
-      ) {
-        return;
-      }
       next(err);
     }
   });
 
-  // POST /api/movies/:id/search
-  app.post("/api/movies/:id/search", (req: Request, res: Response) => {
-    const movieId = String(req.params.id ?? "");
-    const movie = movies.get(movieId);
-    if (!movie) {
-      res.status(404).json({
-        error: {
-          code: "MOVIE_NOT_FOUND",
-          message: "Movie not found."
-        }
-      });
-      return;
+  async function extractFramesWithCacheReuse(
+    job: InternalSearchJob,
+    movie: MovieRecord
+  ): Promise<ExtractedFrame[]> {
+    const cacheKey = `${movie.id}:${job.sampleStepSeconds}`;
+    const existingLock = frameExtractionLocks.get(cacheKey);
+    if (existingLock) {
+      return existingLock;
     }
 
-    const rawQuery = req.body?.query;
-    if (typeof rawQuery !== "string" || rawQuery.trim().length === 0) {
-      res.status(400).json({
-        error: {
-          code: "INVALID_QUERY",
-          message: "A non-empty scene description query is required."
-        }
-      });
-      return;
-    }
+    const promise = extractSampledFrames({
+      moviePath: movie.filePath,
+      outputDir: job.framesDir,
+      sampleStepSeconds: job.sampleStepSeconds,
+      width: movie.width,
+      height: movie.height,
+      ffmpegBin,
+      signal: job.abortController.signal
+    }).finally(() => {
+      frameExtractionLocks.delete(cacheKey);
+    });
 
-    const query = rawQuery.trim();
-    const requestedStep =
-      typeof req.body?.sampleStepSeconds === "number" ? req.body.sampleStepSeconds : undefined;
-    const sampleStepSeconds = chooseSampleStepSeconds(movie.durationSeconds, requestedStep);
-
-    const searchId = `srch_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-    const framesDir = path.join(searchesBaseDir, searchId, "frames");
-    const abortController = new AbortController();
-
-    const job: InternalSearchJob = {
-      id: searchId,
-      movieId: movie.id,
-      query,
-      status: "queued",
-      processed: 0,
-      total: 0,
-      sampleStepSeconds,
-      results: [],
-      framesDir,
-      abortController
-    };
-
-    searches.set(searchId, job);
-
-    void runSearchPipeline(job, movie);
-
-    res.status(202).json({ searchId });
-  });
+    frameExtractionLocks.set(cacheKey, promise);
+    return promise;
+  }
 
   async function runSearchPipeline(job: InternalSearchJob, movie: MovieRecord): Promise<void> {
     const { signal } = job.abortController;
@@ -614,15 +727,7 @@ export function createApp(options: BackendServerOptions = {}): {
 
       job.status = "extracting";
 
-      const extractedFrames: ExtractedFrame[] = await extractSampledFrames({
-        moviePath: movie.filePath,
-        outputDir: job.framesDir,
-        sampleStepSeconds: job.sampleStepSeconds,
-        width: movie.width,
-        height: movie.height,
-        ffmpegBin,
-        signal
-      });
+      const extractedFrames = await extractFramesWithCacheReuse(job, movie);
 
       if (isCancelled()) {
         job.status = "cancelled";
@@ -808,8 +913,13 @@ export function createApp(options: BackendServerOptions = {}): {
 
       res.setHeader("Content-Type", "image/jpeg");
       res.setHeader("Cache-Control", "public, max-age=3600");
-      const stream = fs.createReadStream(filePath);
-      stream.on("error", next);
+      const stream = trackReadStream(fs.createReadStream(filePath));
+      req.once("close", () => stream.destroy());
+      stream.on("error", (err) => {
+        if (!res.headersSent) {
+          next(err);
+        }
+      });
       stream.pipe(res);
     }
   );
@@ -849,9 +959,20 @@ export function createApp(options: BackendServerOptions = {}): {
       ctrl.abort();
     }
     activeClipControllers.clear();
+    for (const stream of activeStreams) {
+      stream.destroy();
+    }
+    activeStreams.clear();
   };
 
-  return { app, cancelAllSearches };
+  const waitForActiveOperations = async (): Promise<void> => {
+    if (inFlightOperations.size === 0) {
+      return;
+    }
+    await Promise.allSettled([...inFlightOperations]);
+  };
+
+  return { app, cancelAllSearches, waitForActiveOperations };
 }
 
 export async function startServer(
@@ -861,8 +982,16 @@ export async function startServer(
   const requestedPort =
     options.port !== undefined ? options.port : Number(process.env.PORT ?? 3000) || 3000;
 
-  const { app, cancelAllSearches } = createApp(options);
+  const { app, cancelAllSearches, waitForActiveOperations } = createApp(options);
   const server = http.createServer(app);
+  const sockets = new Set<Socket>();
+
+  server.on("connection", (socket: Socket) => {
+    sockets.add(socket);
+    socket.once("close", () => {
+      sockets.delete(socket);
+    });
+  });
 
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -884,6 +1013,15 @@ export async function startServer(
     }
     closed = true;
     cancelAllSearches();
+    await waitForActiveOperations();
+
+    server.closeIdleConnections?.();
+    server.closeAllConnections?.();
+    for (const socket of sockets) {
+      socket.destroy();
+    }
+    sockets.clear();
+
     await new Promise<void>((resolve, reject) => {
       server.close((err) => {
         if (err) {
