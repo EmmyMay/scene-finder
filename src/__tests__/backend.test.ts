@@ -917,4 +917,110 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     expect(errResult.error?.message).not.toContain("secret_typesafe_key_xyz987");
     expect(errResult.error?.message).toContain("[REDACTED]");
   });
+
+  it("keeps shared frame extraction alive for remaining concurrent searches when one search is cancelled, and closes active clip download streams promptly on close()", async () => {
+    const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-shared-extract-"));
+    tempDirs.push(dataDir);
+
+    const wrapperDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-ffmpeg-wrap-"));
+    tempDirs.push(wrapperDir);
+    const extractStartedFile = path.join(wrapperDir, "extract-started.txt");
+    const slowFfmpegPath = path.join(wrapperDir, "slow-extract-ffmpeg.sh");
+
+    // Delay only frame extraction invocations (which contain showinfo in args) by 0.6s so both searches attach to the in-flight extraction
+    await fsp.writeFile(
+      slowFfmpegPath,
+      `#!/bin/sh
+case "$*" in
+  *showinfo*)
+    echo "started" > "${extractStartedFile}"
+    sleep 0.6
+    ;;
+esac
+exec ffmpeg "$@"
+`,
+      { mode: 0o755 }
+    );
+
+    const server = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      dataDir,
+      ffmpegPath: slowFfmpegPath,
+      jevScorer: {
+        async scoreFrameWindow(input) {
+          return Object.fromEntries(
+            input.frames.map((f) => [f.id, f.timestampSeconds >= 2 ? 0.85 : 0.1])
+          );
+        }
+      }
+    });
+    activeServers.push(server);
+
+    const fileBytes = await fsp.readFile(syntheticMoviePath);
+    const formData = new FormData();
+    formData.append("file", new Blob([fileBytes], { type: "video/mp4" }), "clip.mp4");
+    const uploadRes = await fetch(`${server.url}/api/movies`, {
+      method: "POST",
+      body: formData
+    });
+    const { movie } = (await uploadRes.json()) as { movie: { id: string } };
+
+    // Start Search A and Search B concurrently so they share the in-flight frame extraction
+    const [resA, resB] = await Promise.all([
+      fetch(`${server.url}/api/movies/${movie.id}/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "green scene A" })
+      }),
+      fetch(`${server.url}/api/movies/${movie.id}/search`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "green scene B" })
+      })
+    ]);
+    const { searchId: searchA } = (await resA.json()) as { searchId: string };
+    const { searchId: searchB } = (await resB.json()) as { searchId: string };
+
+    const waitDeadline = Date.now() + 5000;
+    while (!fs.existsSync(extractStartedFile) && Date.now() < waitDeadline) {
+      await new Promise((r) => setTimeout(r, 20));
+    }
+    expect(fs.existsSync(extractStartedFile)).toBe(true);
+
+    // Cancel Search A while extraction is still running
+    const cancelRes = await fetch(`${server.url}/api/searches/${searchA}`, {
+      method: "DELETE"
+    });
+    expect(cancelRes.status).toBe(200);
+
+    const [finalA, finalB] = await Promise.all([
+      pollSearchUntilTerminal(server.url, searchA),
+      pollSearchUntilTerminal(server.url, searchB)
+    ]);
+
+    expect(finalA.status).toBe("cancelled");
+    expect(finalB.status).toBe("completed");
+    expect(finalB.results).toHaveLength(1);
+    expect(finalB.results[0].startSeconds).toBe(2);
+
+    // Now test that an active clip download stream does not hang server.close()
+    const clipRes = await fetch(`${server.url}/api/movies/${movie.id}/clips`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        startSeconds: 0,
+        endSeconds: 2
+      })
+    });
+    expect(clipRes.status).toBe(200);
+    // Intentionally do not consume clipRes.body before calling close()
+    const closeStart = Date.now();
+    await server.close();
+    activeServers.pop();
+    const closeElapsedMs = Date.now() - closeStart;
+    expect(closeElapsedMs).toBeLessThan(2000);
+    await clipRes.body?.cancel().catch(() => undefined);
+  });
 });
+

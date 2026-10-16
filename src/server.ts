@@ -157,13 +157,19 @@ export function createApp(options: BackendServerOptions = {}): {
       apiBaseUrl: baseConfig.jevApiBaseUrl
     });
 
+  interface SharedExtractionEntry {
+    abortController: AbortController;
+    consumers: Set<AbortSignal>;
+    promise: Promise<ExtractedFrame[]>;
+  }
+
   const movies = new Map<string, MovieRecord>();
   const searches = new Map<string, InternalSearchJob>();
   const activePrepareControllers = new Set<AbortController>();
   const activeClipControllers = new Set<AbortController>();
   const activeStreams = new Set<fs.ReadStream>();
   const inFlightOperations = new Set<Promise<unknown>>();
-  const frameExtractionLocks = new Map<string, Promise<ExtractedFrame[]>>();
+  const frameExtractionLocks = new Map<string, SharedExtractionEntry>();
 
   function trackOperation<T>(promise: Promise<T>): Promise<T> {
     const tracked = promise.finally(() => {
@@ -595,10 +601,39 @@ export function createApp(options: BackendServerOptions = {}): {
 
           await new Promise<void>((resolve, reject) => {
             const stream = trackReadStream(fs.createReadStream(outputClipPath));
-            req.once("close", () => stream.destroy());
-            stream.on("error", reject);
-            res.on("close", () => resolve());
-            res.on("finish", () => resolve());
+            const onAbortClip = (): void => {
+              stream.destroy();
+              if (!res.writableEnded) {
+                res.destroy();
+              }
+              resolve();
+            };
+            clipAbortController.signal.addEventListener("abort", onAbortClip, { once: true });
+            req.once("close", () => {
+              stream.destroy();
+              resolve();
+            });
+            stream.once("error", (err) => {
+              clipAbortController.signal.removeEventListener("abort", onAbortClip);
+              if (clipAbortController.signal.aborted) {
+                resolve();
+                return;
+              }
+              reject(err);
+            });
+            stream.once("close", () => {
+              clipAbortController.signal.removeEventListener("abort", onAbortClip);
+              resolve();
+            });
+            res.once("close", () => {
+              clipAbortController.signal.removeEventListener("abort", onAbortClip);
+              stream.destroy();
+              resolve();
+            });
+            res.once("finish", () => {
+              clipAbortController.signal.removeEventListener("abort", onAbortClip);
+              resolve();
+            });
             stream.pipe(res);
           });
 
@@ -685,26 +720,74 @@ export function createApp(options: BackendServerOptions = {}): {
     job: InternalSearchJob,
     movie: MovieRecord
   ): Promise<ExtractedFrame[]> {
-    const cacheKey = `${movie.id}:${job.sampleStepSeconds}`;
-    const existingLock = frameExtractionLocks.get(cacheKey);
-    if (existingLock) {
-      return existingLock;
+    const consumerSignal = job.abortController.signal;
+    if (consumerSignal.aborted) {
+      const abortErr = new Error("Operation cancelled");
+      abortErr.name = "AbortError";
+      throw abortErr;
     }
 
-    const promise = extractSampledFrames({
-      moviePath: movie.filePath,
-      outputDir: job.framesDir,
-      sampleStepSeconds: job.sampleStepSeconds,
-      width: movie.width,
-      height: movie.height,
-      ffmpegBin,
-      signal: job.abortController.signal
-    }).finally(() => {
-      frameExtractionLocks.delete(cacheKey);
-    });
+    const cacheKey = `${movie.id}:${job.sampleStepSeconds}`;
+    let entry = frameExtractionLocks.get(cacheKey);
 
-    frameExtractionLocks.set(cacheKey, promise);
-    return promise;
+    if (!entry) {
+      const sharedAbortController = new AbortController();
+      const consumers = new Set<AbortSignal>();
+      const promise = extractSampledFrames({
+        moviePath: movie.filePath,
+        outputDir: job.framesDir,
+        sampleStepSeconds: job.sampleStepSeconds,
+        width: movie.width,
+        height: movie.height,
+        ffmpegBin,
+        signal: sharedAbortController.signal
+      }).finally(() => {
+        frameExtractionLocks.delete(cacheKey);
+      });
+
+      entry = {
+        abortController: sharedAbortController,
+        consumers,
+        promise
+      };
+      frameExtractionLocks.set(cacheKey, entry);
+    }
+
+    const currentEntry = entry;
+    currentEntry.consumers.add(consumerSignal);
+
+    return new Promise<ExtractedFrame[]>((resolve, reject) => {
+      const onConsumerAbort = (): void => {
+        currentEntry.consumers.delete(consumerSignal);
+        if (currentEntry.consumers.size === 0) {
+          currentEntry.abortController.abort();
+        }
+        const abortErr = new Error("Operation cancelled");
+        abortErr.name = "AbortError";
+        reject(abortErr);
+      };
+
+      consumerSignal.addEventListener("abort", onConsumerAbort, { once: true });
+
+      currentEntry.promise.then(
+        (frames) => {
+          consumerSignal.removeEventListener("abort", onConsumerAbort);
+          currentEntry.consumers.delete(consumerSignal);
+          if (consumerSignal.aborted) {
+            const abortErr = new Error("Operation cancelled");
+            abortErr.name = "AbortError";
+            reject(abortErr);
+            return;
+          }
+          resolve(frames);
+        },
+        (err) => {
+          consumerSignal.removeEventListener("abort", onConsumerAbort);
+          currentEntry.consumers.delete(consumerSignal);
+          reject(err);
+        }
+      );
+    });
   }
 
   async function runSearchPipeline(job: InternalSearchJob, movie: MovieRecord): Promise<void> {
@@ -951,6 +1034,10 @@ export function createApp(options: BackendServerOptions = {}): {
         job.abortController.abort();
       }
     }
+    for (const entry of frameExtractionLocks.values()) {
+      entry.abortController.abort();
+    }
+    frameExtractionLocks.clear();
     for (const ctrl of activePrepareControllers) {
       ctrl.abort();
     }
@@ -1013,7 +1100,6 @@ export async function startServer(
     }
     closed = true;
     cancelAllSearches();
-    await waitForActiveOperations();
 
     server.closeIdleConnections?.();
     server.closeAllConnections?.();
@@ -1021,6 +1107,8 @@ export async function startServer(
       socket.destroy();
     }
     sockets.clear();
+
+    await waitForActiveOperations();
 
     await new Promise<void>((resolve, reject) => {
       server.close((err) => {
