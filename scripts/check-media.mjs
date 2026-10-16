@@ -8,7 +8,7 @@ const directory = path.resolve('.data/media');
 const suffix = process.platform === 'win32' ? '.exe' : '';
 const ffmpeg = path.join(directory, `ffmpeg${suffix}`);
 const ffprobe = path.join(directory, `ffprobe${suffix}`);
-const run = (file, args) => execFileSync(file, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] });
+const run = (file, args) => execFileSync(file, args, { encoding: 'utf8', maxBuffer: 64 * 1024 * 1024, stdio: ['ignore', 'pipe', 'pipe'] });
 for (const binary of [ffmpeg, ffprobe]) {
   const data = await readFile(binary);
   let architecture;

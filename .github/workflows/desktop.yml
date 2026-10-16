@@ -24,7 +24,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - uses: actions/cache@v4
+      - uses: actions/cache/restore@v4
         id: media-cache
         with:
           path: .data/media
@@ -67,6 +67,11 @@ jobs:
       - name: Add media tools to PATH
         shell: bash
         run: echo "$GITHUB_WORKSPACE/.data/media" >> "$GITHUB_PATH"
+      - uses: actions/cache/save@v4
+        if: steps.media-cache.outputs.cache-hit != 'true'
+        with:
+          path: .data/media
+          key: ${{ steps.media-cache.outputs.cache-primary-key }}
       - name: Verify native media
         run: node scripts/check-media.mjs
       - run: npm run typecheck
