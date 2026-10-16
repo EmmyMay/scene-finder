@@ -11,6 +11,8 @@ const ui = Object.fromEntries([
   "sample-note", "settings-button", "settings-dialog", "close-settings", "settings-form",
   "api-key", "connection-status", "settings-error", "save-connection", "remove-connection",
   "cleanup-notice", "cleanup-message", "retry-cleanup",
+  "clip-editor", "clip-duration", "clip-start", "clip-end", "set-clip-start", "set-clip-end",
+  "clip-error", "preview-clip",
 ].map(id => [id, document.getElementById(id)]));
 
 const state = { generation: 0, movie: null, upload: null, run: null, ready: false, results: [], duration: 0 };
@@ -20,6 +22,7 @@ const hasDesktopSettings = desktop && ["getSettings", "saveApiKey", "clearApiKey
 const connection = { configured: false, loaded: false, busy: false };
 // Detached jobs outlive the active movie until cancellation is confirmed.
 const pendingCleanup = new Set();
+const clip = { previewing: false };
 
 function timecode(seconds) {
   const total = Math.max(0, Math.floor(Number(seconds) || 0));
@@ -279,6 +282,9 @@ function detachSearch() {
 }
 
 function resetMovie() {
+  stopClipPreview();
+  ui["clip-editor"].hidden = true;
+  ui["clip-error"].hidden = true;
   state.generation += 1;
   detachSearch();
   const upload = state.upload;
@@ -374,6 +380,8 @@ function uploadMovie(file) {
     ui["movie-details"].textContent = movie.width && movie.height ? `${movie.width} × ${movie.height}` : "";
     ui["timeline-end"].textContent = timecode(state.duration);
     ui["playback-time"].textContent = `00:00 / ${timecode(state.duration)}`;
+    seedClip({ startSeconds: 0, endSeconds: Math.min(5, state.duration) });
+    ui["clip-editor"].hidden = false;
     resultStatus("Describe a scene to find matching moments.");
     updateControls();
     ui["scene-query"].focus();
@@ -454,7 +462,86 @@ function seekTo(result) {
   player.currentTime = Math.min(result.startSeconds, player.duration);
   ui["timeline"].value = String(player.currentTime);
   markActive(result.id);
+  seedClip(result);
 }
+
+function clipTime(seconds) {
+  const millis = Math.max(0, Math.floor(seconds * 1000 + 0.000001));
+  const hours = Math.floor(millis / 3600000);
+  const minutes = Math.floor(millis / 60000) % 60;
+  const wholeSeconds = Math.floor(millis / 1000) % 60;
+  return `${[hours, minutes, wholeSeconds].map(value => String(value).padStart(2, "0")).join(":")}.${String(millis % 1000).padStart(3, "0")}`;
+}
+
+function parseClipTime(value) {
+  const match = /^(\d+):([0-5]\d):([0-5]\d)(?:\.(\d{1,3}))?$/.exec(value.trim());
+  if (!match) return NaN;
+  return Number(match[1]) * 3600 + Number(match[2]) * 60 + Number(match[3]) + Number((match[4] || "").padEnd(3, "0")) / 1000;
+}
+
+function clipRange() {
+  const startSeconds = parseClipTime(ui["clip-start"].value);
+  const endSeconds = parseClipTime(ui["clip-end"].value);
+  if (!state.movie || !Number.isFinite(startSeconds) || !Number.isFinite(endSeconds) || startSeconds < 0 || endSeconds <= startSeconds || endSeconds > state.duration) return null;
+  return { startSeconds, endSeconds };
+}
+
+function updateClipControls(showError = false) {
+  const range = clipRange();
+  ui["clip-duration"].textContent = range ? `${((range.endSeconds - range.startSeconds)).toFixed(3)}s selected` : "";
+  ui["preview-clip"].disabled = !range || player.readyState < 1;
+  ui["preview-clip"].textContent = clip.previewing ? "Stop preview" : "Preview clip";
+  ui["clip-error"].hidden = !showError || Boolean(range);
+  if (!range && showError) ui["clip-error"].textContent = "Enter valid timecodes with an out point after the in point and within this movie.";
+}
+
+function stopClipPreview() {
+  clip.version = (clip.version || 0) + 1;
+  if (clip.previewing) player.pause();
+  clip.previewing = false;
+  ui["preview-clip"].textContent = "Preview clip";
+}
+
+function seedClip(result) {
+  stopClipPreview();
+  const start = Math.min(result.startSeconds, state.duration);
+  // An initial editable selection gives an isolated sampled hit some playback context.
+  // It is a clip choice, not a claim about the detected scene boundary.
+  const end = Math.min(state.duration, Math.max(result.endSeconds, start + 3));
+  ui["clip-start"].value = clipTime(start);
+  ui["clip-end"].value = clipTime(end);
+  updateClipControls();
+}
+
+async function previewClip() {
+  if (clip.previewing) { stopClipPreview(); updateClipControls(); return; }
+  const range = clipRange();
+  if (!range || player.readyState < 1) { updateClipControls(true); return; }
+  const version = clip.version = (clip.version || 0) + 1;
+  ui["clip-error"].hidden = true;
+  player.currentTime = range.startSeconds;
+  clip.previewing = true;
+  updateClipControls();
+  try { await player.play(); } catch {
+    if (version !== clip.version) return;
+    stopClipPreview();
+    ui["clip-error"].textContent = "The clip preview could not play. Try loading the movie again.";
+    ui["clip-error"].hidden = false;
+  }
+}
+
+for (const id of ["clip-start", "clip-end"]) {
+  ui[id].addEventListener("input", () => { stopClipPreview(); updateClipControls(); });
+  ui[id].addEventListener("change", () => updateClipControls(true));
+}
+for (const boundary of ["start", "end"]) ui[`set-clip-${boundary}`].addEventListener("click", () => {
+  if (!state.movie || player.readyState < 1) return;
+  stopClipPreview();
+  ui[`clip-${boundary}`].value = clipTime(Math.min(player.currentTime, state.duration));
+  updateClipControls(true);
+});
+ui["preview-clip"].addEventListener("click", previewClip);
+player.addEventListener("pause", () => { clip.previewing = false; updateClipControls(); });
 
 function renderResults(results, step) {
   clearResults();
@@ -625,6 +712,7 @@ player.addEventListener("loadedmetadata", () => {
   ui["timeline"].max = String(player.duration);
   ui["timeline"].disabled = false;
   ui["timeline-end"].textContent = timecode(player.duration);
+  updateClipControls();
 });
 player.addEventListener("timeupdate", () => {
   if (!state.movie) return;
@@ -633,6 +721,12 @@ player.addEventListener("timeupdate", () => {
   ui["timeline"].value = String(player.currentTime);
   const active = state.results.find(result => player.currentTime >= result.startSeconds && player.currentTime <= Math.max(result.endSeconds, result.startSeconds + .5));
   markActive(active?.id);
+  const range = clip.previewing && clipRange();
+  if (range && player.currentTime >= range.endSeconds) {
+    stopClipPreview();
+    player.currentTime = range.endSeconds;
+    updateClipControls();
+  }
 });
 player.addEventListener("error", () => { if (state.movie) notice("Scene Finder could not play this movie. Choose it again to retry. If playback still fails, report this app issue."); });
 ui["timeline"].addEventListener("input", () => { if (player.readyState >= 1) player.currentTime = Number(ui["timeline"].value); });

@@ -67,6 +67,15 @@ main { max-width: 1600px; margin: auto; padding: 26px 32px 24px; }
 .button-light:hover { background: white; }
 .button-primary { color: white; background: var(--violet); width: 100%; justify-content: space-between; }
 .button-primary:hover:not(:disabled) { background: #5b46b8; }
+.button-secondary { background: white; color: var(--ink); border-color: var(--line); font-size: 14px; min-height: 40px; }
+.button-secondary:hover:not(:disabled) { background: var(--lavender); }
+.clip-editor { border-top: 1px solid var(--line); margin-top: 18px; padding-top: 22px; }
+.clip-editor h3 { font-size: 13px; }
+.clip-fields { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; }
+.clip-fields > div { min-width: 0; }
+.clip-fields label { display: block; font-size: 13px; font-weight: 600; margin-bottom: 7px; }
+.clip-time { display: block; width: 100%; min-width: 0; padding: 10px; border: 1px solid #cdd2dd; border-radius: 6px; background: white; color: var(--ink); font: 13px var(--mono); }
+.clip-fields .text-button { margin-top: 7px; font-size: 12px; white-space: normal; text-align: left; }
 .upload-hint { display: block; color: #b4bac9; font-size: 12px; margin-top: 15px; }
 .drop-hint { display: none; position: absolute; inset: 12px; border: 2px dashed #cec4ff; border-radius: 6px; place-items: center; background: #171c29ed; font: 500 20px var(--display); pointer-events: none; }
 .is-dragging .drop-hint { display: grid; }
