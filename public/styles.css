@@ -34,6 +34,18 @@ h1, h2, h3 { font-family: var(--display); font-weight: 500; }
 .brand h1 { font-size: 15px; letter-spacing: -.5px; }
 .brand svg { color: var(--violet); }
 .settings-button { display: inline-flex; align-items: center; gap: 7px; min-height: 34px; padding: 6px 10px; border: 1px solid var(--line); border-radius: 6px; color: var(--ink); background: transparent; font-size: 13px; }
+.settings-button:hover { background: var(--lavender); }
+.settings-dialog { width: min(460px, calc(100% - 32px)); padding: 26px; border: 1px solid var(--line); border-radius: 12px; background: var(--canvas); color: var(--ink); box-shadow: 0 20px 70px #171c2930; }
+.settings-dialog::backdrop { background: #171c2966; }
+.settings-heading { display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.settings-heading h2 { font-size: 16px; letter-spacing: -.5px; }
+.connection-status { padding: 12px 14px; margin-bottom: 22px; border-radius: 6px; background: var(--lavender); font-size: 14px; }
+.settings-dialog label { display: block; font-size: 14px; font-weight: 600; margin-bottom: 9px; }
+#api-key { display: block; width: 100%; padding: 12px; border: 1px solid #cdd2dd; border-radius: 6px; font: 14px var(--mono); background: white; color: var(--ink); }
+.settings-actions { display: flex; justify-content: flex-end; align-items: center; gap: 20px; }
+.settings-actions .button { width: auto; font-size: 14px; }
+.settings-actions > .text-button { margin-right: auto; color: #8d3026; white-space: normal; text-align: left; }
+.settings-error { font-size: 14px; line-height: 1.5; color: #8d3026; margin-bottom: 15px; overflow-wrap: anywhere; }
 main { max-width: 1600px; margin: auto; padding: 26px 32px 24px; }
 .eyebrow { font-size: 10px; font-weight: 600; letter-spacing: 2px; color: #606a7c; }
 .workspace-grid { display: grid; grid-template-columns: minmax(0, 1fr) minmax(290px, 340px); align-items: start; gap: 34px; }

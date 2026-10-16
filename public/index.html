@@ -18,7 +18,7 @@
         <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><rect x="3" y="5" width="26" height="22" rx="6" fill="currentColor"/><path d="M10 5v22M22 5v22M3 12h7M3 20h7M22 12h7M22 20h7" stroke="#F6F7FA" stroke-width="1.5"/><path d="m14 12 6 4-6 4z" fill="#F6F7FA"/></svg>
         <h1>Scene Finder</h1>
       </div>
-      <button id="settings-button" class="settings-button" type="button" title="Connection settings" disabled>
+      <button id="settings-button" class="settings-button" type="button" title="Connection settings" hidden>
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3" fill="#F6F7FA"/><circle cx="16" cy="17" r="3" fill="#F6F7FA"/></svg>
         Settings
       </button>
@@ -82,6 +82,18 @@
         </aside>
       </div>
     </main>
+    <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-description">
+      <div class="settings-heading"><h2 id="settings-title">Scene search connection</h2><button id="close-settings" class="text-button" type="button" aria-label="Close settings">Close</button></div>
+      <p id="settings-description" class="field-hint">Connect Jev to find matching frames in your movies.</p>
+      <p id="connection-status" class="connection-status" role="status">Checking connection…</p>
+      <form id="settings-form">
+        <label for="api-key">Jev API key</label>
+        <input id="api-key" type="password" placeholder="Enter an API key" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="key-hint" required>
+        <p id="key-hint" class="field-hint">Your saved key is never displayed. Enter a new key to replace the connection.</p>
+        <p id="settings-error" class="settings-error" role="alert" hidden></p>
+        <div class="settings-actions"><button id="remove-connection" class="text-button" type="button" hidden>Remove connection</button><button id="save-connection" class="button button-primary" type="submit" disabled>Save connection</button></div>
+      </form>
+    </dialog>
     <noscript><p class="notice">Enable JavaScript to upload a movie and find scenes.</p></noscript>
   </body>
 </html>
