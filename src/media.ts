@@ -1,4 +1,5 @@
 import { spawn } from "node:child_process";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import path from "node:path";
@@ -15,25 +16,66 @@ export interface ProbedVideoInfo {
   pixFmt: string;
   audioCodec: string | null;
   hasAudio: boolean;
+  videoStreamCount: number;
+}
+
+function killChildProcessTree(child: ReturnType<typeof spawn>): void {
+  if (process.platform !== "win32" && typeof child.pid === "number" && child.pid > 0) {
+    try {
+      process.kill(-child.pid, "SIGKILL");
+    } catch {
+      // Ignore if group already exited
+    }
+  }
+  try {
+    child.kill("SIGKILL");
+  } catch {
+    // Ignore if already exited
+  }
+  child.stdout?.destroy();
+  child.stderr?.destroy();
+}
+
+export async function moveFileCrossDevice(sourcePath: string, targetPath: string): Promise<void> {
+  try {
+    await fsp.rename(sourcePath, targetPath);
+  } catch (err) {
+    const code = (err as NodeJS.ErrnoException | undefined)?.code;
+    if (code === "EXDEV") {
+      await fsp.copyFile(sourcePath, targetPath);
+      await fsp.unlink(sourcePath);
+      return;
+    }
+    throw err;
+  }
 }
 
 export async function checkBinaryAvailable(binary: string): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
+    let settled = false;
+    const finish = (ok: boolean): void => {
+      if (!settled) {
+        settled = true;
+        resolve(ok);
+      }
+    };
+
     const child = spawn(binary, ["-version"], {
-      stdio: ["ignore", "ignore", "ignore"]
+      stdio: ["ignore", "ignore", "ignore"],
+      detached: process.platform !== "win32"
     });
     const timer = setTimeout(() => {
-      child.kill("SIGKILL");
-      resolve(false);
+      killChildProcessTree(child);
+      finish(false);
     }, 4000);
 
     child.on("error", () => {
       clearTimeout(timer);
-      resolve(false);
+      finish(false);
     });
     child.on("close", (code) => {
       clearTimeout(timer);
-      resolve(code === 0);
+      finish(code === 0);
     });
   });
 }
@@ -51,18 +93,23 @@ function runProcess(
       return;
     }
 
+    let settled = false;
     const child = spawn(command, args, {
-      stdio: ["ignore", "pipe", "pipe"]
+      stdio: ["ignore", "pipe", "pipe"],
+      detached: process.platform !== "win32"
     });
 
     let stdout = "";
     let stderr = "";
 
     const onAbort = (): void => {
-      child.kill("SIGKILL");
-      const abortErr = new Error("Operation cancelled");
-      abortErr.name = "AbortError";
-      reject(abortErr);
+      killChildProcessTree(child);
+      if (!settled) {
+        settled = true;
+        const abortErr = new Error("Operation cancelled");
+        abortErr.name = "AbortError";
+        reject(abortErr);
+      }
     };
 
     signal?.addEventListener("abort", onAbort, { once: true });
@@ -79,11 +126,18 @@ function runProcess(
 
     child.on("error", (err) => {
       signal?.removeEventListener("abort", onAbort);
-      reject(err);
+      if (!settled) {
+        settled = true;
+        reject(err);
+      }
     });
 
     child.on("close", (code) => {
       signal?.removeEventListener("abort", onAbort);
+      if (settled) {
+        return;
+      }
+      settled = true;
       if (signal?.aborted) {
         const abortErr = new Error("Operation cancelled");
         abortErr.name = "AbortError";
@@ -150,12 +204,14 @@ export async function probeVideoFile(
   }
 
   const streams = probeJson.streams ?? [];
-  const videoStream = streams.find((s) => s.codec_type === "video");
+  const videoStreams = streams.filter((s) => s.codec_type === "video");
+  const videoStream = videoStreams[0];
   if (!videoStream) {
     throw new AppError("INVALID_MOVIE", "Uploaded file does not contain a video stream.", 400);
   }
 
-  const audioStream = streams.find((s) => s.codec_type === "audio");
+  const audioStreams = streams.filter((s) => s.codec_type === "audio");
+  const audioStream = audioStreams[0];
 
   const width = Number(videoStream.width);
   const height = Number(videoStream.height);
@@ -165,11 +221,14 @@ export async function probeVideoFile(
 
   let durationSeconds = Number(videoStream.duration);
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
-    durationSeconds = Number(probeJson.format?.duration);
+    // When multiple video streams exist, format.duration may reflect a different stream;
+    // prefer packet timestamps of v:0 before falling back to format.duration.
+    if (videoStreams.length === 1) {
+      durationSeconds = Number(probeJson.format?.duration);
+    }
   }
 
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
-    // Fallback: inspect packet timestamps if container header lacks duration (common in MKV/WebM)
     try {
       const { stdout: packetOut } = await runProcess(
         ffprobeBin,
@@ -209,6 +268,10 @@ export async function probeVideoFile(
   }
 
   if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
+    durationSeconds = Number(probeJson.format?.duration);
+  }
+
+  if (!Number.isFinite(durationSeconds) || durationSeconds <= 0) {
     throw new AppError(
       "INVALID_MOVIE",
       "Video file does not have a valid positive duration.",
@@ -224,7 +287,8 @@ export async function probeVideoFile(
     videoCodec: (videoStream.codec_name ?? "").toLowerCase(),
     pixFmt: (videoStream.pix_fmt ?? "").toLowerCase(),
     audioCodec: audioStream ? (audioStream.codec_name ?? "").toLowerCase() : null,
-    hasAudio: Boolean(audioStream)
+    hasAudio: Boolean(audioStream),
+    videoStreamCount: videoStreams.length
   };
 }
 
@@ -238,10 +302,8 @@ export interface PreparePlayableMovieOptions {
 }
 
 /**
- * Ensures the movie is in a Chromium-playable H.264/AAC MP4 container:
- * - If already an MP4 container with H.264 (yuv420p) video and AAC (or no) audio, uses it directly.
- * - If video is already H.264 (yuv420p) inside MKV/MOV/etc., tries fast remuxing first (copying video, copying/encoding AAC audio).
- * - Otherwise transcodes to H.264 (yuv420p) + AAC MP4 with +faststart.
+ * Ensures the movie is in a Chromium-playable H.264/AAC MP4 container containing
+ * strictly the primary video stream `0:v:0` (and `0:a:0?`).
  */
 export async function preparePlayableMovie(
   options: PreparePlayableMovieOptions
@@ -258,7 +320,12 @@ export async function preparePlayableMovie(
   const isCompatibleAudio =
     !options.probed.hasAudio || options.probed.audioCodec === "aac";
 
-  if (isMp4Container && isCompatibleH264 && isCompatibleAudio) {
+  if (
+    isMp4Container &&
+    isCompatibleH264 &&
+    isCompatibleAudio &&
+    options.probed.videoStreamCount === 1
+  ) {
     return {
       playablePath: options.sourcePath,
       probed: options.probed
@@ -267,7 +334,6 @@ export async function preparePlayableMovie(
 
   try {
     if (isCompatibleH264) {
-      // Fast remux path for MKV/MOV containing H.264 video
       try {
         const audioArgs = !options.probed.hasAudio
           ? ["-an"]
@@ -286,6 +352,8 @@ export async function preparePlayableMovie(
             "0:v:0",
             "-c:v",
             "copy",
+            "-disposition:v:0",
+            "default",
             ...audioArgs,
             "-movflags",
             "+faststart",
@@ -308,7 +376,6 @@ export async function preparePlayableMovie(
         if (remuxErr instanceof Error && remuxErr.name === "AbortError") {
           throw remuxErr;
         }
-        // Fall through to full H.264/AAC transcode if container remux fails
       }
     }
 
@@ -335,6 +402,8 @@ export async function preparePlayableMovie(
         "22",
         "-pix_fmt",
         "yuv420p",
+        "-disposition:v:0",
+        "default",
         ...audioTranscodeArgs,
         "-movflags",
         "+faststart",
@@ -375,9 +444,6 @@ export interface ExportMovieClipOptions {
   signal?: AbortSignal;
 }
 
-/**
- * Exports an accurate H.264/AAC MP4 clip from `[startSeconds, endSeconds]`, preserving available audio.
- */
 export async function exportMovieClip(options: ExportMovieClipOptions): Promise<void> {
   const ffmpegBin = options.ffmpegBin ?? "ffmpeg";
   try {
@@ -428,10 +494,6 @@ export async function exportMovieClip(options: ExportMovieClipOptions): Promise<
   }
 }
 
-/**
- * TypeSafe Jev image API requires each dimension in [280, 1568]
- * and total pixels in [78_400, 2_458_624].
- */
 export function computeTargetFrameDimensions(
   width: number,
   height: number
@@ -469,25 +531,44 @@ export function computeTargetFrameDimensions(
   return { width: w, height: h };
 }
 
+/**
+ * Selects a candid, consistent sampling interval (0.5s for <=2s clips, 1s for <=120s, 2s for longer movies)
+ * and validates any caller-supplied `requestedStepSeconds` is finite and has a positive minimum after rounding.
+ */
 export function chooseSampleStepSeconds(
   durationSeconds: number,
-  requestedStepSeconds?: number
+  requestedStepSeconds?: unknown
 ): number {
-  if (
-    typeof requestedStepSeconds === "number" &&
-    Number.isFinite(requestedStepSeconds) &&
-    requestedStepSeconds > 0
-  ) {
-    return roundTimestamp(requestedStepSeconds);
+  if (requestedStepSeconds !== undefined) {
+    if (
+      typeof requestedStepSeconds !== "number" ||
+      !Number.isFinite(requestedStepSeconds) ||
+      requestedStepSeconds <= 0
+    ) {
+      throw new AppError(
+        "INVALID_SAMPLE_STEP",
+        "sampleStepSeconds must be a finite positive number.",
+        400
+      );
+    }
+    const rounded = roundTimestamp(requestedStepSeconds);
+    if (rounded < 0.05) {
+      throw new AppError(
+        "INVALID_SAMPLE_STEP",
+        "sampleStepSeconds must be at least 0.05 seconds after rounding.",
+        400
+      );
+    }
+    return rounded;
   }
 
   if (durationSeconds <= 2) {
     return 0.5;
   }
-  if (durationSeconds <= 180) {
+  if (durationSeconds <= 120) {
     return 1;
   }
-  return Math.max(1, Math.ceil(durationSeconds / 150));
+  return 2;
 }
 
 export function parseShowinfoTimestamps(stderr: string): Map<number, number> {
@@ -516,76 +597,148 @@ export interface ExtractFramesOptions {
   signal?: AbortSignal;
 }
 
+interface CachedFramesManifest {
+  sampleStepSeconds: number;
+  frames: Array<{
+    id: string;
+    index: number;
+    timestampSeconds: number;
+    fileName: string;
+  }>;
+}
+
 export async function extractSampledFrames(
   options: ExtractFramesOptions
 ): Promise<ExtractedFrame[]> {
-  fs.mkdirSync(options.outputDir, { recursive: true });
-
-  const targetDims = computeTargetFrameDimensions(options.width, options.height);
-  const stepExpr = Number(options.sampleStepSeconds.toFixed(4));
-  const filterChain = [
-    `select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,${stepExpr})'`,
-    "showinfo",
-    `scale=${targetDims.width}:${targetDims.height}`
-  ].join(",");
-
-  const outputPattern = path.join(options.outputDir, "frame_%d.jpg");
-
-  const { stderr } = await runProcess(
-    options.ffmpegBin ?? "ffmpeg",
-    [
-      "-hide_banner",
-      "-nostdin",
-      "-i",
-      options.moviePath,
-      "-vf",
-      filterChain,
-      "-fps_mode",
-      "vfr",
-      "-start_number",
-      "0",
-      "-q:v",
-      "2",
-      outputPattern,
-      "-y"
-    ],
-    options.signal
-  );
-
-  const measuredTimestamps = parseShowinfoTimestamps(stderr);
-
-  const files = fs
-    .readdirSync(options.outputDir)
-    .filter((f) => /^frame_\d+\.jpg$/.test(f))
-    .map((fileName) => {
-      const match = /^frame_(\d+)\.jpg$/.exec(fileName);
-      return {
-        fileName,
-        index: match ? Number(match[1]) : -1
-      };
-    })
-    .filter((item) => item.index >= 0)
-    .sort((a, b) => a.index - b.index);
-
-  const extracted: ExtractedFrame[] = [];
-  for (const item of files) {
-    const measuredTime = measuredTimestamps.get(item.index);
-    if (measuredTime === undefined) {
-      throw new AppError(
-        "TIMESTAMP_MEASUREMENT_FAILED",
-        `Failed to measure presentation timestamp for extracted frame_${item.index}.`,
-        500
-      );
+  const manifestPath = path.join(options.outputDir, "manifest.json");
+  if (fs.existsSync(manifestPath)) {
+    try {
+      const raw = await fsp.readFile(manifestPath, "utf8");
+      const parsed = JSON.parse(raw) as CachedFramesManifest;
+      if (
+        parsed.sampleStepSeconds === options.sampleStepSeconds &&
+        Array.isArray(parsed.frames) &&
+        parsed.frames.length > 0
+      ) {
+        const resolved: ExtractedFrame[] = [];
+        let allExist = true;
+        for (const item of parsed.frames) {
+          const filePath = path.join(options.outputDir, item.fileName);
+          if (!fs.existsSync(filePath)) {
+            allExist = false;
+            break;
+          }
+          resolved.push({
+            id: item.id,
+            index: item.index,
+            timestampSeconds: item.timestampSeconds,
+            fileName: item.fileName,
+            filePath
+          });
+        }
+        if (allExist) {
+          return resolved;
+        }
+      }
+    } catch {
+      // Re-extract if cache manifest is unreadable
     }
-    const id = `frame_${item.index}`;
-    extracted.push({
-      id,
-      index: item.index,
-      timestampSeconds: measuredTime,
-      fileName: item.fileName,
-      filePath: path.join(options.outputDir, item.fileName)
-    });
   }
 
-  return extracted;
+  const tempExtractDir = `${options.outputDir}.tmp_${crypto.randomUUID().slice(0, 8)}`;
+  await fsp.mkdir(tempExtractDir, { recursive: true });
+
+  try {
+    const targetDims = computeTargetFrameDimensions(options.width, options.height);
+    const stepExpr = Number(options.sampleStepSeconds.toFixed(4));
+    const filterChain = [
+      `select='isnan(prev_selected_t)+gte(t-prev_selected_t\\,${stepExpr})'`,
+      "showinfo",
+      `scale=${targetDims.width}:${targetDims.height}`
+    ].join(",");
+
+    const outputPattern = path.join(tempExtractDir, "frame_%d.jpg");
+
+    const { stderr } = await runProcess(
+      options.ffmpegBin ?? "ffmpeg",
+      [
+        "-hide_banner",
+        "-nostdin",
+        "-i",
+        options.moviePath,
+        "-map",
+        "0:v:0",
+        "-vf",
+        filterChain,
+        "-fps_mode",
+        "vfr",
+        "-start_number",
+        "0",
+        "-q:v",
+        "2",
+        outputPattern,
+        "-y"
+      ],
+      options.signal
+    );
+
+    const measuredTimestamps = parseShowinfoTimestamps(stderr);
+
+    const files = fs
+      .readdirSync(tempExtractDir)
+      .filter((f) => /^frame_\d+\.jpg$/.test(f))
+      .map((fileName) => {
+        const match = /^frame_(\d+)\.jpg$/.exec(fileName);
+        return {
+          fileName,
+          index: match ? Number(match[1]) : -1
+        };
+      })
+      .filter((item) => item.index >= 0)
+      .sort((a, b) => a.index - b.index);
+
+    const manifestFrames: CachedFramesManifest["frames"] = [];
+    for (const item of files) {
+      const measuredTime = measuredTimestamps.get(item.index);
+      if (measuredTime === undefined) {
+        throw new AppError(
+          "TIMESTAMP_MEASUREMENT_FAILED",
+          `Failed to measure presentation timestamp for extracted frame_${item.index}.`,
+          500
+        );
+      }
+      manifestFrames.push({
+        id: `frame_${item.index}`,
+        index: item.index,
+        timestampSeconds: measuredTime,
+        fileName: item.fileName
+      });
+    }
+
+    const manifest: CachedFramesManifest = {
+      sampleStepSeconds: options.sampleStepSeconds,
+      frames: manifestFrames
+    };
+    await fsp.writeFile(
+      path.join(tempExtractDir, "manifest.json"),
+      JSON.stringify(manifest),
+      "utf8"
+    );
+
+    await fsp.mkdir(path.dirname(options.outputDir), { recursive: true });
+    if (!fs.existsSync(manifestPath)) {
+      await fsp.rm(options.outputDir, { recursive: true, force: true }).catch(() => undefined);
+      await moveFileCrossDevice(tempExtractDir, options.outputDir);
+    } else {
+      await fsp.rm(tempExtractDir, { recursive: true, force: true }).catch(() => undefined);
+    }
+
+    return manifestFrames.map((item) => ({
+      ...item,
+      filePath: path.join(options.outputDir, item.fileName)
+    }));
+  } catch (err) {
+    await fsp.rm(tempExtractDir, { recursive: true, force: true }).catch(() => undefined);
+    throw err;
+  }
 }

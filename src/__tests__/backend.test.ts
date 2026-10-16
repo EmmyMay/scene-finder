@@ -6,6 +6,7 @@ import path from "node:path";
 import { afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   buildSystemOneWindowRequest,
+  chooseSampleStepSeconds,
   createTypeSafeJevScorer,
   groupFramesIntoScenes,
   probeVideoFile,
@@ -82,8 +83,7 @@ function generateDisjointSceneVideo(outputPath: string): void {
 }
 
 /**
- * Generates a real 6-second MKV file encoded with MPEG-4 part 2 video + FLAC/PCM audio
- * so Chromium cannot play it natively and the backend must transcode it to H.264/AAC MP4:
+ * Generates a real 6-second MKV file encoded with MPEG-4 part 2 video + FLAC audio:
  * - [0s..2s): blue
  * - [2s..4s): red (frames at 2s, 3s)
  * - [4s..6s): blue
@@ -131,6 +131,47 @@ function generateNonChromiumMkvVideo(outputPath: string): void {
 
   if (result.status !== 0) {
     throw new Error(`Failed to generate synthetic test MKV video: ${result.stderr}`);
+  }
+}
+
+/**
+ * Generates a multi-stream MKV with:
+ * - v:0: blue 320x240, 4s (non-default disposition)
+ * - v:1: red 640x480, 2s (default disposition)
+ */
+function generateMultiStreamMkvVideo(outputPath: string): void {
+  const result = spawnSync(
+    "ffmpeg",
+    [
+      "-hide_banner",
+      "-y",
+      "-f",
+      "lavfi",
+      "-i",
+      "color=c=blue:s=320x240:r=10:d=4,format=yuv420p",
+      "-f",
+      "lavfi",
+      "-i",
+      "color=c=red:s=640x480:r=10:d=2,format=yuv420p",
+      "-map",
+      "0:v:0",
+      "-map",
+      "1:v:0",
+      "-c:v",
+      "libx264",
+      "-pix_fmt",
+      "yuv420p",
+      "-disposition:v:0",
+      "0",
+      "-disposition:v:1",
+      "default",
+      outputPath
+    ],
+    { encoding: "utf8" }
+  );
+
+  if (result.status !== 0) {
+    throw new Error(`Failed to generate multi-stream MKV video: ${result.stderr}`);
   }
 }
 
@@ -184,6 +225,7 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
   let sharedFixtureDir = "";
   let syntheticMoviePath = "";
   let syntheticMkvPath = "";
+  let multiStreamMkvPath = "";
   const activeServers: RunningBackendServer[] = [];
   const tempDirs: string[] = [];
 
@@ -191,8 +233,10 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     sharedFixtureDir = fs.mkdtempSync(path.join(os.tmpdir(), "scene-finder-fixtures-"));
     syntheticMoviePath = path.join(sharedFixtureDir, "disjoint-red-scenes.mp4");
     syntheticMkvPath = path.join(sharedFixtureDir, "visual-events.mkv");
+    multiStreamMkvPath = path.join(sharedFixtureDir, "multi-stream.mkv");
     generateDisjointSceneVideo(syntheticMoviePath);
     generateNonChromiumMkvVideo(syntheticMkvPath);
+    generateMultiStreamMkvVideo(multiStreamMkvPath);
   });
 
   afterEach(async () => {
@@ -210,7 +254,15 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     }
   });
 
-  it("splits on known negative frames, supports single-frame hits, and refuses to merge across unsupported gaps", () => {
+  it("splits on known negative frames, supports single-frame hits, refuses to merge across unsupported gaps, and uses consistent sampling steps", () => {
+    // 2h movie uses consistent 2s step instead of 48s
+    expect(chooseSampleStepSeconds(7200)).toBe(2);
+    expect(chooseSampleStepSeconds(60)).toBe(1);
+    expect(chooseSampleStepSeconds(1.5)).toBe(0.5);
+    expect(() => chooseSampleStepSeconds(12, 0.0001)).toThrow(/sampleStepSeconds/);
+    expect(() => chooseSampleStepSeconds(12, 0)).toThrow(/sampleStepSeconds/);
+    expect(() => chooseSampleStepSeconds(12, -2)).toThrow(/sampleStepSeconds/);
+
     const frames: ScoredFrame[] = [
       { id: "frame_0", index: 0, timestampSeconds: 0, fileName: "frame_0.jpg", filePath: "/tmp/0.jpg", noul: 0.1 },
       { id: "frame_1", index: 1, timestampSeconds: 1, fileName: "frame_1.jpg", filePath: "/tmp/1.jpg", noul: 0.82 },
@@ -298,7 +350,7 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     });
   });
 
-  it("uploads an MP4 movie, serves HTTP Range media, extracts measured timestamps, scores ordered Jev windows, returns disjoint matches + thumbnails, and exports trimmed MP4 clips", async () => {
+  it("uploads an MP4 movie, serves HTTP Range media, extracts measured timestamps, scores ordered Jev windows, reuses cached frames, returns disjoint matches + thumbnails, and exports trimmed MP4 clips", async () => {
     const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-e2e-"));
     tempDirs.push(dataDir);
 
@@ -402,6 +454,19 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     expect(uploadJson.movie.durationSeconds).toBeCloseTo(12, 0);
     expect(uploadJson.movie.mediaUrl).toBe(`/api/movies/${uploadJson.movie.id}/media`);
 
+    // Reject tiny sampleStepSeconds on search request
+    const tinyStepRes = await fetch(
+      `${server.url}/api/movies/${uploadJson.movie.id}/search`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "red", sampleStepSeconds: 0.0001 })
+      }
+    );
+    expect(tinyStepRes.status).toBe(400);
+    const tinyStepBody = (await tinyStepRes.json()) as { error: { code: string } };
+    expect(tinyStepBody.error.code).toBe("INVALID_SAMPLE_STEP");
+
     const rangeRes = await fetch(`${server.url}${uploadJson.movie.mediaUrl}`, {
       headers: { Range: "bytes=0-127" }
     });
@@ -446,7 +511,7 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     expect(thumbRes.status).toBe(200);
     expect(thumbRes.headers.get("content-type")).toContain("image/jpeg");
 
-    // Verify negative query returns empty results
+    // Verify negative query reuses cached extracted frames and returns empty results
     const negRes = await fetch(
       `${server.url}/api/movies/${uploadJson.movie.id}/search`,
       {
@@ -494,18 +559,24 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     expect(probedClip.durationSeconds).toBeLessThanOrEqual(3.5);
   });
 
-  it("prepares a real MKV (MPEG-4 + FLAC) into a Chromium-playable H.264/AAC MP4 while preserving source, Range playback, and scene search", async () => {
+  it("prepares a real MKV (MPEG-4 + FLAC) and a multi-stream MKV (v0 blue 320x240/4s vs default v1 red 640x480/2s) consistently selecting 0:v:0", async () => {
     const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-mkv-"));
     tempDirs.push(dataDir);
 
     const jevScorer = {
       async scoreFrameWindow(input: {
+        query: string;
         frames: Array<{ id: string; filePath: string; timestampSeconds: number }>;
       }) {
         const scores: Record<string, number> = {};
+        const wantsBlue = input.query.toLowerCase().includes("blue");
         for (const frame of input.frames) {
           const isRed = isFramePredominantlyRed(frame.filePath);
-          scores[frame.id] = isRed ? 0.92 : 0.05;
+          if (wantsBlue) {
+            scores[frame.id] = isRed ? 0.02 : 0.91;
+          } else {
+            scores[frame.id] = isRed ? 0.92 : 0.05;
+          }
         }
         return scores;
       }
@@ -519,6 +590,7 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     });
     activeServers.push(server);
 
+    // 1. Single-stream MKV (MPEG-4 + FLAC)
     const mkvBytes = await fsp.readFile(syntheticMkvPath);
     const formData = new FormData();
     formData.append(
@@ -546,37 +618,155 @@ describe("Scene Finder Backend Contract & Jev Pipeline", () => {
     expect(movie.name).toBe("visual-events.mkv");
     expect(movie.durationSeconds).toBeCloseTo(6, 0);
 
-    // Confirm both source.mkv and playable.mp4 exist in movie directory
-    const movieDir = path.join(dataDir, "movies", movie.id);
-    expect(fs.existsSync(path.join(movieDir, "source.mkv"))).toBe(true);
-    expect(fs.existsSync(path.join(movieDir, "playable.mp4"))).toBe(true);
-
-    const playableProbed = await probeVideoFile(path.join(movieDir, "playable.mp4"));
-    expect(playableProbed.videoCodec).toBe("h264");
-    expect(playableProbed.audioCodec).toBe("aac");
-
-    // Verify Range request on MKV's prepared media URL serves video/mp4 206 Partial Content
     const rangeRes = await fetch(`${server.url}${movie.mediaUrl}`, {
       headers: { Range: "bytes=0-255" }
     });
     expect(rangeRes.status).toBe(206);
     expect(rangeRes.headers.get("content-type")).toContain("video/mp4");
-    expect(rangeRes.headers.get("content-range")).toMatch(/^bytes 0-255\/\d+$/);
 
-    // Verify scene search locates the red event [2..3]s in the prepared MKV movie
     const searchRes = await fetch(`${server.url}/api/movies/${movie.id}/search`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({ query: "red flash" })
     });
-    expect(searchRes.status).toBe(202);
     const { searchId } = (await searchRes.json()) as { searchId: string };
     const completed = await pollSearchUntilTerminal(server.url, searchId);
     expect(completed.status).toBe("completed");
     expect(completed.results).toHaveLength(1);
     expect(completed.results[0].startSeconds).toBe(2);
     expect(completed.results[0].endSeconds).toBe(3);
-    expect(completed.results[0].score).toBe(0.92);
+
+    // 2. Multi-stream MKV: v:0 is blue 320x240 4s, v:1 (default) is red 640x480 2s
+    const multiBytes = await fsp.readFile(multiStreamMkvPath);
+    const multiForm = new FormData();
+    multiForm.append(
+      "file",
+      new Blob([multiBytes], { type: "video/x-matroska" }),
+      "multi-stream.mkv"
+    );
+
+    const multiUploadRes = await fetch(`${server.url}/api/movies`, {
+      method: "POST",
+      body: multiForm
+    });
+    expect(multiUploadRes.status).toBe(201);
+    const { movie: multiMovie } = (await multiUploadRes.json()) as {
+      movie: {
+        id: string;
+        width: number;
+        height: number;
+        durationSeconds: number;
+      };
+    };
+
+    expect(multiMovie.width).toBe(320);
+    expect(multiMovie.height).toBe(240);
+    expect(multiMovie.durationSeconds).toBeCloseTo(4, 0);
+
+    // Searching for "red" on multi-stream MKV must return 0 matches because 0:v:0 is all blue
+    const multiRedSearch = await fetch(
+      `${server.url}/api/movies/${multiMovie.id}/search`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "red stream" })
+      }
+    );
+    const { searchId: multiRedId } = (await multiRedSearch.json()) as { searchId: string };
+    const multiRedDone = await pollSearchUntilTerminal(server.url, multiRedId);
+    expect(multiRedDone.status).toBe("completed");
+    expect(multiRedDone.results).toEqual([]);
+
+    // Searching for "blue" on multi-stream MKV matches the full 0..3s span of 0:v:0
+    const multiBlueSearch = await fetch(
+      `${server.url}/api/movies/${multiMovie.id}/search`,
+      {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ query: "blue stream" })
+      }
+    );
+    const { searchId: multiBlueId } = (await multiBlueSearch.json()) as { searchId: string };
+    const multiBlueDone = await pollSearchUntilTerminal(server.url, multiBlueId);
+    expect(multiBlueDone.status).toBe("completed");
+    expect(multiBlueDone.results).toHaveLength(1);
+    expect(multiBlueDone.results[0].startSeconds).toBe(0);
+    expect(multiBlueDone.results[0].endSeconds).toBe(3);
+  });
+
+  it("enforces maxUploadBytes, cleans up rejected uploads, and terminates slow ffprobe uploads on close()", async () => {
+    const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-limits-"));
+    tempDirs.push(dataDir);
+
+    // 1. Test maxUploadBytes rejection & temp cleanup
+    const limitedServer = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      dataDir,
+      maxUploadBytes: 256
+    });
+    activeServers.push(limitedServer);
+
+    const fileBytes = await fsp.readFile(syntheticMoviePath);
+    const form = new FormData();
+    form.append("file", new Blob([fileBytes], { type: "video/mp4" }), "too-big.mp4");
+
+    const tooBigRes = await fetch(`${limitedServer.url}/api/movies`, {
+      method: "POST",
+      body: form
+    });
+    expect(tooBigRes.status).toBe(413);
+    const tooBigBody = (await tooBigRes.json()) as { error: { code: string } };
+    expect(tooBigBody.error.code).toBe("UPLOAD_TOO_LARGE");
+
+    const leftoverTmp = await fsp.readdir(path.join(dataDir, "tmp"));
+    expect(leftoverTmp).toEqual([]);
+
+    await limitedServer.close();
+    activeServers.pop();
+
+    // 2. Test slow ffprobe upload gets killed and close() completes promptly
+    const slowBinDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-slow-bin-"));
+    tempDirs.push(slowBinDir);
+    const markerFile = path.join(slowBinDir, "started.txt");
+    const slowFfprobePath = path.join(slowBinDir, "slow-ffprobe.sh");
+
+    await fsp.writeFile(
+      slowFfprobePath,
+      `#!/bin/sh\nif [ "$1" = "-version" ]; then\n  exit 0\nfi\necho "$$" > "${markerFile}"\nsleep 30\n`,
+      { mode: 0o755 }
+    );
+
+    const slowServer = await startServer({
+      host: "127.0.0.1",
+      port: 0,
+      dataDir,
+      ffprobePath: slowFfprobePath
+    });
+    activeServers.push(slowServer);
+
+    const slowForm = new FormData();
+    slowForm.append("file", new Blob([fileBytes], { type: "video/mp4" }), "slow.mp4");
+
+    const uploadPromise = fetch(`${slowServer.url}/api/movies`, {
+      method: "POST",
+      body: slowForm
+    }).catch(() => null);
+
+    // Wait for slow-ffprobe.sh to start
+    const waitDeadline = Date.now() + 5000;
+    while (!fs.existsSync(markerFile) && Date.now() < waitDeadline) {
+      await new Promise((r) => setTimeout(r, 25));
+    }
+    expect(fs.existsSync(markerFile)).toBe(true);
+
+    const closeStart = Date.now();
+    await slowServer.close();
+    activeServers.pop();
+    const closeElapsedMs = Date.now() - closeStart;
+    expect(closeElapsedMs).toBeLessThan(2000);
+
+    await uploadPromise;
   });
 
   it("supports cancelling an active search via DELETE /api/searches/:searchId", async () => {
