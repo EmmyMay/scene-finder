@@ -21,8 +21,10 @@ export interface MovieMetadata {
 }
 
 export interface MovieRecord extends MovieMetadata {
+  sourceFilePath: string;
   filePath: string;
   mimeType: string;
+  hasAudio: boolean;
 }
 
 export interface SceneResult {

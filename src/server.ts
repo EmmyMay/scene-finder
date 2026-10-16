@@ -11,10 +11,12 @@ import { createTypeSafeJevScorer } from "./jev-client.js";
 import {
   checkBinaryAvailable,
   chooseSampleStepSeconds,
+  exportMovieClip,
   extractSampledFrames,
+  preparePlayableMovie,
   probeVideoFile
 } from "./media.js";
-import { groupFramesIntoScenes } from "./scene-grouping.js";
+import { groupFramesIntoScenes, roundTimestamp } from "./scene-grouping.js";
 import type {
   ExtractedFrame,
   HealthResponse,
@@ -70,31 +72,6 @@ interface InternalSearchJob {
   abortController: AbortController;
 }
 
-function inferVideoMimeType(fileName: string, fallbackMime?: string): string {
-  const ext = path.extname(fileName).toLowerCase();
-  switch (ext) {
-    case ".mp4":
-    case ".m4v":
-      return "video/mp4";
-    case ".webm":
-      return "video/webm";
-    case ".mov":
-      return "video/quicktime";
-    case ".mkv":
-      return "video/x-matroska";
-    case ".avi":
-      return "video/x-msvideo";
-    case ".ogv":
-    case ".ogg":
-      return "video/ogg";
-    default:
-      if (fallbackMime && fallbackMime.startsWith("video/")) {
-        return fallbackMime;
-      }
-      return "video/mp4";
-  }
-}
-
 function safeTimingEqual(expected: string, provided: string): boolean {
   const a = Buffer.from(expected, "utf8");
   const b = Buffer.from(provided, "utf8");
@@ -102,6 +79,12 @@ function safeTimingEqual(expected: string, provided: string): boolean {
     return false;
   }
   return crypto.timingSafeEqual(a, b);
+}
+
+function sanitizeAttachmentStem(name: string): string {
+  const base = path.basename(name, path.extname(name));
+  const cleaned = base.replace(/[^a-zA-Z0-9._-]+/g, "-").replace(/^-+|-+$/g, "");
+  return cleaned || "scene";
 }
 
 export function createApp(options: BackendServerOptions = {}): {
@@ -148,9 +131,11 @@ export function createApp(options: BackendServerOptions = {}): {
   const apiToken = options.apiToken?.trim() || "";
 
   const uploadsTmpDir = path.join(baseConfig.dataDir, "tmp");
+  const clipsTmpDir = path.join(baseConfig.dataDir, "clips");
   const moviesBaseDir = path.join(baseConfig.dataDir, "movies");
   const searchesBaseDir = path.join(baseConfig.dataDir, "searches");
   fs.mkdirSync(uploadsTmpDir, { recursive: true });
+  fs.mkdirSync(clipsTmpDir, { recursive: true });
   fs.mkdirSync(moviesBaseDir, { recursive: true });
   fs.mkdirSync(searchesBaseDir, { recursive: true });
 
@@ -164,6 +149,8 @@ export function createApp(options: BackendServerOptions = {}): {
 
   const movies = new Map<string, MovieRecord>();
   const searches = new Map<string, InternalSearchJob>();
+  const activePrepareControllers = new Set<AbortController>();
+  const activeClipControllers = new Set<AbortController>();
 
   const upload = multer({
     storage: multer.diskStorage({
@@ -225,8 +212,35 @@ export function createApp(options: BackendServerOptions = {}): {
 
   // POST /api/movies
   app.post("/api/movies", (req: Request, res: Response, next: NextFunction) => {
+    // Replacing an in-flight upload preparation stops the previous preparation immediately
+    for (const prevController of activePrepareControllers) {
+      prevController.abort();
+    }
+    activePrepareControllers.clear();
+
+    const prepAbortController = new AbortController();
+    activePrepareControllers.add(prepAbortController);
+
+    const onDisconnect = (): void => {
+      if (!res.writableEnded) {
+        prepAbortController.abort();
+      }
+    };
+    req.on("aborted", onDisconnect);
+    res.on("close", onDisconnect);
+
     upload.single("file")(req, res, async (uploadErr: unknown) => {
+      const cleanupController = (): void => {
+        req.removeListener("aborted", onDisconnect);
+        res.removeListener("close", onDisconnect);
+        activePrepareControllers.delete(prepAbortController);
+      };
+
       if (uploadErr) {
+        cleanupController();
+        if (prepAbortController.signal.aborted) {
+          return;
+        }
         const msg =
           uploadErr instanceof Error ? uploadErr.message : "Failed to parse multipart upload.";
         res.status(400).json({
@@ -240,6 +254,10 @@ export function createApp(options: BackendServerOptions = {}): {
 
       const file = req.file;
       if (!file) {
+        cleanupController();
+        if (prepAbortController.signal.aborted) {
+          return;
+        }
         res.status(400).json({
           error: {
             code: "MISSING_FILE",
@@ -249,26 +267,49 @@ export function createApp(options: BackendServerOptions = {}): {
         return;
       }
 
-      try {
-        const probed = await probeVideoFile(file.path, ffprobeBin);
-        const movieId = `mov_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
-        const movieDir = path.join(moviesBaseDir, movieId);
-        await fsp.mkdir(movieDir, { recursive: true });
+      const movieId = `mov_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      const movieDir = path.join(moviesBaseDir, movieId);
 
+      try {
+        const initialProbed = await probeVideoFile(
+          file.path,
+          ffprobeBin,
+          prepAbortController.signal
+        );
+
+        await fsp.mkdir(movieDir, { recursive: true });
         const originalName = path.basename(file.originalname || "movie.mp4");
         const ext = path.extname(originalName) || ".mp4";
-        const storedPath = path.join(movieDir, `source${ext}`);
-        await fsp.rename(file.path, storedPath);
+        const sourcePath = path.join(movieDir, `source${ext}`);
+        await fsp.rename(file.path, sourcePath);
+
+        const playableTargetPath = path.join(movieDir, "playable.mp4");
+        const prepared = await preparePlayableMovie({
+          sourcePath,
+          playableOutputPath: playableTargetPath,
+          probed: initialProbed,
+          ffmpegBin,
+          ffprobeBin,
+          signal: prepAbortController.signal
+        });
+
+        cleanupController();
+        if (prepAbortController.signal.aborted) {
+          await fsp.rm(movieDir, { recursive: true, force: true }).catch(() => undefined);
+          return;
+        }
 
         const record: MovieRecord = {
           id: movieId,
           name: originalName,
-          durationSeconds: probed.durationSeconds,
-          width: probed.width,
-          height: probed.height,
+          durationSeconds: prepared.probed.durationSeconds,
+          width: prepared.probed.width,
+          height: prepared.probed.height,
           mediaUrl: `/api/movies/${movieId}/media`,
-          filePath: storedPath,
-          mimeType: inferVideoMimeType(originalName, file.mimetype)
+          sourceFilePath: sourcePath,
+          filePath: prepared.playablePath,
+          mimeType: "video/mp4",
+          hasAudio: prepared.probed.hasAudio
         };
 
         movies.set(movieId, record);
@@ -284,7 +325,24 @@ export function createApp(options: BackendServerOptions = {}): {
           }
         });
       } catch (err) {
+        cleanupController();
         await fsp.unlink(file.path).catch(() => undefined);
+        await fsp.rm(movieDir, { recursive: true, force: true }).catch(() => undefined);
+
+        if (
+          prepAbortController.signal.aborted ||
+          (err instanceof Error && err.name === "AbortError")
+        ) {
+          if (!res.headersSent && !res.writableEnded) {
+            res.status(499).json({
+              error: {
+                code: "UPLOAD_CANCELLED",
+                message: "Movie upload or playback preparation was cancelled."
+              }
+            });
+          }
+          return;
+        }
         next(err);
       }
     });
@@ -336,7 +394,6 @@ export function createApp(options: BackendServerOptions = {}): {
       let end: number;
 
       if (match[1] === "") {
-        // Suffix byte-range-spec: bytes=-500
         const suffixLength = Number(match[2]);
         if (!Number.isInteger(suffixLength) || suffixLength <= 0) {
           res.setHeader("Content-Range", `bytes */${fileSize}`);
@@ -378,6 +435,107 @@ export function createApp(options: BackendServerOptions = {}): {
       stream.on("error", next);
       stream.pipe(res);
     } catch (err) {
+      next(err);
+    }
+  });
+
+  // POST /api/movies/:id/clips
+  app.post("/api/movies/:id/clips", async (req: Request, res: Response, next: NextFunction) => {
+    const movieId = String(req.params.id ?? "");
+    const movie = movies.get(movieId);
+    if (!movie || !fs.existsSync(movie.filePath)) {
+      res.status(404).json({
+        error: {
+          code: "MOVIE_NOT_FOUND",
+          message: "Movie not found."
+        }
+      });
+      return;
+    }
+
+    const startSeconds = req.body?.startSeconds;
+    const endSeconds = req.body?.endSeconds;
+
+    if (
+      typeof startSeconds !== "number" ||
+      !Number.isFinite(startSeconds) ||
+      typeof endSeconds !== "number" ||
+      !Number.isFinite(endSeconds) ||
+      startSeconds < 0 ||
+      startSeconds >= endSeconds ||
+      endSeconds > movie.durationSeconds
+    ) {
+      res.status(400).json({
+        error: {
+          code: "INVALID_CLIP_RANGE",
+          message: `Clip range must satisfy 0 <= startSeconds < endSeconds <= ${movie.durationSeconds}.`
+        }
+      });
+      return;
+    }
+
+    const clipAbortController = new AbortController();
+    activeClipControllers.add(clipAbortController);
+    const outputClipPath = path.join(clipsTmpDir, `clip_${crypto.randomUUID()}.mp4`);
+
+    const onDisconnect = (): void => {
+      if (!res.writableEnded) {
+        clipAbortController.abort();
+      }
+    };
+    req.on("aborted", onDisconnect);
+    res.on("close", onDisconnect);
+
+    const cleanupClip = async (): Promise<void> => {
+      req.removeListener("aborted", onDisconnect);
+      res.removeListener("close", onDisconnect);
+      activeClipControllers.delete(clipAbortController);
+      await fsp.unlink(outputClipPath).catch(() => undefined);
+    };
+
+    try {
+      await exportMovieClip({
+        playableMoviePath: movie.filePath,
+        outputClipPath,
+        startSeconds,
+        endSeconds,
+        ffmpegBin,
+        signal: clipAbortController.signal
+      });
+
+      if (clipAbortController.signal.aborted) {
+        await cleanupClip();
+        return;
+      }
+
+      const stat = await fsp.stat(outputClipPath);
+      const stem = sanitizeAttachmentStem(movie.name);
+      const startLabel = roundTimestamp(startSeconds).toFixed(2).replace(/\.?0+$/, "");
+      const endLabel = roundTimestamp(endSeconds).toFixed(2).replace(/\.?0+$/, "");
+      const downloadFileName = `${stem}-${startLabel}s-${endLabel}s.mp4`;
+
+      res.status(200);
+      res.setHeader("Content-Type", "video/mp4");
+      res.setHeader("Content-Disposition", `attachment; filename="${downloadFileName}"`);
+      res.setHeader("Content-Length", String(stat.size));
+
+      await new Promise<void>((resolve, reject) => {
+        const stream = fs.createReadStream(outputClipPath);
+        stream.on("error", reject);
+        res.on("close", () => resolve());
+        res.on("finish", () => resolve());
+        stream.pipe(res);
+      });
+
+      await cleanupClip();
+    } catch (err) {
+      await cleanupClip();
+      if (
+        clipAbortController.signal.aborted ||
+        (err instanceof Error && err.name === "AbortError")
+      ) {
+        return;
+      }
       next(err);
     }
   });
@@ -431,7 +589,6 @@ export function createApp(options: BackendServerOptions = {}): {
 
     searches.set(searchId, job);
 
-    // Kick off async search pipeline
     void runSearchPipeline(job, movie);
 
     res.status(202).json({ searchId });
@@ -447,7 +604,6 @@ export function createApp(options: BackendServerOptions = {}): {
         return;
       }
 
-      // Fail fast with a setup error if no API key is configured and no test scorer is injected
       if (!options.jevScorer && getCurrentApiKey().length === 0) {
         throw new AppError(
           "MISSING_API_KEY",
@@ -658,12 +814,10 @@ export function createApp(options: BackendServerOptions = {}): {
     }
   );
 
-  // Serve public/ directory if present for browser preview / desktop shell UI
   if (fs.existsSync(publicDir)) {
     app.use(express.static(publicDir));
   }
 
-  // Centralized error handler
   app.use((err: unknown, _req: Request, res: Response, _next: NextFunction) => {
     const statusCode = err instanceof AppError ? err.statusCode : 500;
     const code = err instanceof AppError ? err.code : "INTERNAL_ERROR";
@@ -687,6 +841,14 @@ export function createApp(options: BackendServerOptions = {}): {
         job.abortController.abort();
       }
     }
+    for (const ctrl of activePrepareControllers) {
+      ctrl.abort();
+    }
+    activePrepareControllers.clear();
+    for (const ctrl of activeClipControllers) {
+      ctrl.abort();
+    }
+    activeClipControllers.clear();
   };
 
   return { app, cancelAllSearches };
