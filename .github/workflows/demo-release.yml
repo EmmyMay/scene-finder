@@ -36,6 +36,8 @@ jobs:
         run: |
           [[ "$RUN_ID" =~ ^[0-9]+$ ]]
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+-demo\.[0-9]+$ ]]
+          existing=$(git ls-remote --tags origin "refs/tags/$RELEASE_TAG")
+          if [[ -n "$existing" ]]; then echo 'The demo tag already exists.'; exit 1; fi
           gh api "repos/$GH_REPO/actions/runs/$RUN_ID" > run.json
           jq -e --arg repo "$GH_REPO" '.name == "Desktop builds" and .status == "completed" and .conclusion == "success" and .head_repository.full_name == $repo' run.json
           revision=$(jq -r .head_sha run.json)
