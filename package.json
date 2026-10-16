@@ -8,7 +8,10 @@
     "start": "tsx src/index.ts",
     "build": "tsc -p tsconfig.json",
     "typecheck": "tsc --noEmit",
-    "test": "vitest run src"
+    "test": "vitest run --dir src",
+    "desktop": "npm run build && node scripts/run-desktop.mjs",
+    "package:desktop": "npm run build && node scripts/package-desktop.mjs",
+    "media:prepare": "bash scripts/prepare-media.sh"
   },
   "dependencies": {
     "express": "^4.21.2",
@@ -20,6 +23,11 @@
     "@types/node": "^22.10.0",
     "tsx": "^4.19.2",
     "typescript": "^5.7.2",
-    "vitest": "^5.0.5"
-  }
+    "vitest": "^5.0.5",
+    "@electron/asar": "^4.3.1",
+    "@electron/packager": "^20.3.0",
+    "electron": "^44.7.2"
+  },
+  "main": "desktop/main.cjs",
+  "description": "Find and clip moments from your movies"
 }
