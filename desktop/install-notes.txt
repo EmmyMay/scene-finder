@@ -1,0 +1,12 @@
+YOUR FIRST SCENE
+
+1. Open Settings and connect your own Jev API key.
+2. Choose an MP4 or MKV movie from your computer.
+3. Describe a visible moment, then select a matching scene.
+4. Set IN and OUT, preview your selection, and export an MP4 clip.
+
+Search needs an internet connection and sends sampled frames and your query to Jev. Provider usage is billed through your own Jev account. Your full movie and exported clips stay on your computer.
+
+This beta installer is not code signed yet. For release information or help, visit https://github.com/EmmyMay/scene-finder/releases
+
+Uninstalling Scene Finder preserves your imported movies and settings in your user profile.
