@@ -1,0 +1,130 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <meta id="theme-color" name="theme-color" content="#111217">
+    <title>Scene Finder</title>
+    <script src="/theme.js"></script>
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=DM+Sans:wght@400;500;600&family=Manrope:wght@500;600;700&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="/styles.css">
+    <script src="/app.js" defer></script>
+  </head>
+  <body>
+    <a class="skip-link" href="#workspace">Skip to workspace</a>
+    <header class="app-toolbar">
+      <div class="brand">
+        <svg viewBox="0 0 32 32" width="26" height="26" aria-hidden="true"><rect x="3" y="5" width="26" height="22" rx="6" fill="currentColor"/><path d="M10 5v22M22 5v22M3 12h7M3 20h7M22 12h7M22 20h7" stroke="var(--canvas)" stroke-width="1.5"/><path d="m14 12 6 4-6 4z" fill="var(--canvas)"/></svg>
+        <span>Scene Finder</span>
+      </div>
+      <div class="toolbar-actions">
+        <div class="theme-switch" role="group" aria-label="Appearance">
+          <button id="theme-light" type="button" aria-pressed="false">Light</button>
+          <button id="theme-dark" type="button" aria-pressed="true">Dark</button>
+        </div>
+        <button id="settings-button" class="settings-button" type="button" title="Connection settings" hidden>
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><path d="M4 7h16M4 17h16"/><circle cx="9" cy="7" r="3" fill="var(--canvas)"/><circle cx="16" cy="17" r="3" fill="var(--canvas)"/></svg>
+          Settings
+        </button>
+      </div>
+    </header>
+
+    <main id="workspace">
+      <div id="setup-notice" class="notice" role="status" hidden></div>
+      <div id="error-notice" class="notice notice-error" role="alert" hidden></div>
+      <div id="cleanup-notice" class="notice notice-error" role="status" hidden><span id="cleanup-message"></span> <button id="retry-cleanup" class="text-button" type="button" hidden>Retry cancellation</button></div>
+
+      <header id="movie-heading" class="movie-heading">
+        <div class="movie-heading-copy"><p class="eyebrow">YOUR SCREENING ROOM</p><h1 id="movie-name">No movie selected</h1><p id="movie-details" class="movie-details">MKV and MP4 supported</p></div>
+        <button id="replace-movie" class="button button-secondary" type="button" hidden>Change movie <span aria-hidden="true">↗</span></button>
+      </header>
+      <div class="workspace-grid">
+        <section class="movie-panel" aria-labelledby="movie-name">
+          <input id="movie-file" type="file" accept="video/*,.mkv,.mov,.mp4,.webm,.avi" hidden>
+          <div id="drop-zone" class="player-stage">
+            <video id="movie-player" controls playsinline preload="metadata" aria-label="Your uploaded movie" hidden></video>
+            <div id="upload-empty" class="upload-empty">
+              <svg class="upload-symbol" viewBox="0 0 64 64" width="64" height="64" aria-hidden="true"><rect x="9" y="8" width="46" height="48" rx="10" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M20 8v48M44 8v48M9 21h11M9 43h11M44 21h11M44 43h11M27 27l10 6-10 6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
+              <h3>Choose your movie</h3>
+              <p>Drop a video here, or choose a file.</p>
+              <button id="choose-movie" class="button button-light" type="button">Choose a movie <span aria-hidden="true">↑</span></button>
+              <span class="upload-hint">MKV and MP4 supported</span>
+            </div>
+            <div id="upload-state" class="upload-state" hidden>
+              <p class="eyebrow">BRINGING IN YOUR MOVIE</p><h3 id="upload-name"></h3>
+              <div class="progress-heading"><span id="upload-label" role="status">Uploading movie…</span><span id="upload-percent" class="timecode"></span></div>
+              <progress id="upload-progress" max="100" value="0" aria-label="Movie upload progress"></progress>
+              <button id="cancel-upload" class="text-button" type="button">Cancel upload</button>
+            </div>
+            <div class="drop-hint" aria-hidden="true">Drop to change movie</div>
+          </div>
+          <section class="timeline-panel" aria-labelledby="timeline-heading">
+            <div class="timeline-heading"><h2 id="timeline-heading">Your matching moments</h2><span id="playback-time" class="timecode">00:00 / 00:00</span></div>
+            <div id="contact-empty" class="contact-empty"><span class="contact-line" aria-hidden="true"></span><p>Matching frames appear here after a search.</p></div>
+            <div id="contact-strip" class="contact-strip" role="group" aria-label="Matching frames, in movie order" hidden></div>
+            <div class="timeline-track"><div id="timeline-markers" class="timeline-markers"></div><input id="timeline" type="range" min="0" max="1" step="0.1" value="0" aria-label="Seek within movie" disabled></div>
+            <div class="timeline-labels"><span class="timecode">00:00</span><span id="timeline-end" class="timecode">—</span></div>
+          </section>
+          <section id="clip-editor" class="clip-editor" aria-labelledby="clip-heading" hidden>
+            <div class="timeline-heading"><div class="clip-heading"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="5" cy="6" r="3"/><circle cx="5" cy="18" r="3"/><path d="m7.5 7.5 13 13m-13-4 13-13"/></svg><h2 id="clip-heading">Make it a clip</h2></div><span id="clip-duration" class="timecode"></span></div>
+            <div class="clip-trim-row">
+              <div class="clip-fields">
+                <div><label for="clip-start">IN</label><input id="clip-start" class="clip-time" type="text" value="00:00:00.000" placeholder="00:00:00.000" aria-describedby="clip-time-hint"><button id="set-clip-start" class="text-button" type="button">Set in at playhead</button></div>
+                <div><label for="clip-end">OUT</label><input id="clip-end" class="clip-time" type="text" value="00:00:00.000" placeholder="00:00:00.000" aria-describedby="clip-time-hint"><button id="set-clip-end" class="text-button" type="button">Set out at playhead</button></div>
+              </div>
+              <div class="clip-actions">
+                <button id="preview-clip" class="button button-secondary" type="button" disabled>Preview clip</button>
+                <button id="export-clip" class="button button-primary" type="button" disabled>Export MP4</button>
+                <button id="cancel-clip-export" class="text-button" type="button" hidden>Cancel export</button>
+                <a id="save-clip" class="button button-primary" hidden>Save MP4 <span aria-hidden="true">↓</span></a>
+              </div>
+            </div>
+            <p id="clip-time-hint" class="field-hint">Set a start and end, then preview your clip.</p>
+            <p id="clip-error" class="settings-error" role="alert" hidden></p>
+            <progress id="clip-export-progress" aria-label="Clip export progress" hidden></progress>
+            <p id="clip-export-status" class="field-hint" role="status" hidden></p>
+          </section>
+        </section>
+
+        <aside class="search-panel" aria-labelledby="search-heading">
+          <div class="finder-heading"><span class="finder-icon"><svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="10" cy="10" r="6"/><path d="m15 15 5 5"/></svg></span><span class="eyebrow">FIND A SCENE</span></div>
+          <h2 id="search-heading">You remember it.<br>Let’s find it.</h2>
+          <p class="finder-intro">Describe a moment. Jump straight to it.</p>
+          <form id="search-form">
+            <div class="query-heading"><label for="scene-query">What happens in the scene?</label><kbd id="query-shortcut" class="timecode" hidden></kbd></div>
+            <textarea id="scene-query" rows="3" maxlength="2000" placeholder="A person waiting under a streetlight in the rain…" aria-describedby="query-hint" required disabled></textarea>
+            <p id="query-hint" class="field-hint">Describe a visible detail, action, or object.</p>
+            <button id="search-button" class="button button-primary" type="submit" disabled><span>Find the scene</span><svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
+          </form>
+          <div id="search-progress-panel" class="search-progress-panel" hidden>
+            <div class="progress-heading"><span id="search-phase" role="status">Preparing search…</span><button id="cancel-search" class="text-button" type="button">Cancel</button></div>
+            <progress id="search-progress" aria-label="Scene search progress"></progress>
+            <p id="search-count" class="field-hint">Waiting to begin</p>
+          </div>
+          <section class="results-panel" aria-labelledby="results-heading">
+            <div class="results-heading"><h3 id="results-heading">Matching moments</h3><span id="results-count" class="result-count" hidden></span></div>
+            <p id="results-status" class="results-status" role="status">Choose a movie to get started.</p>
+            <div id="results-list" class="results-list"></div>
+            <p id="sample-note" class="sample-note" hidden></p>
+          </section>
+          <p class="finder-foot">Your movie stays on this device.<br>Sampled frames go to Jev for search.</p>
+        </aside>
+      </div>
+    </main>
+    <dialog id="settings-dialog" class="settings-dialog" aria-labelledby="settings-title" aria-describedby="settings-description">
+      <div class="settings-heading"><h2 id="settings-title">Scene search connection</h2><button id="close-settings" class="text-button" type="button" aria-label="Close settings">Close</button></div>
+      <p id="settings-description" class="field-hint">Connect Jev to find matching frames in your movies.</p>
+      <p id="connection-status" class="connection-status" role="status">Checking connection…</p>
+      <form id="settings-form">
+        <label for="api-key">Jev API key</label>
+        <input id="api-key" type="password" placeholder="Enter an API key" autocomplete="off" autocapitalize="none" spellcheck="false" aria-describedby="key-hint" required>
+        <p id="key-hint" class="field-hint">Your saved key is never displayed. Enter a new key to replace the connection.</p>
+        <p id="settings-error" class="settings-error" role="alert" hidden></p>
+        <div class="settings-actions"><button id="remove-connection" class="text-button" type="button" hidden>Remove connection</button><button id="save-connection" class="button button-primary" type="submit" disabled>Save connection</button></div>
+      </form>
+    </dialog>
+    <noscript><p class="notice">Enable JavaScript to upload a movie and find scenes.</p></noscript>
+  </body>
+</html>
