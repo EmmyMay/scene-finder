@@ -71,8 +71,8 @@
             <div class="timeline-heading"><div class="clip-heading"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6" aria-hidden="true"><circle cx="5" cy="6" r="3"/><circle cx="5" cy="18" r="3"/><path d="m7.5 7.5 13 13m-13-4 13-13"/></svg><h2 id="clip-heading">Make it a clip</h2></div><span id="clip-duration" class="timecode"></span></div>
             <div class="clip-trim-row">
               <div class="clip-fields">
-                <div><label for="clip-start">IN</label><input id="clip-start" class="clip-time" type="text" value="00:00:00.000" aria-describedby="clip-time-hint"><button id="set-clip-start" class="text-button" type="button">Set in at playhead</button></div>
-                <div><label for="clip-end">OUT</label><input id="clip-end" class="clip-time" type="text" value="00:00:00.000" aria-describedby="clip-time-hint"><button id="set-clip-end" class="text-button" type="button">Set out at playhead</button></div>
+                <div><label for="clip-start">IN</label><input id="clip-start" class="clip-time" type="text" value="00:00:00.000" placeholder="00:00:00.000" aria-describedby="clip-time-hint"><button id="set-clip-start" class="text-button" type="button">Set in at playhead</button></div>
+                <div><label for="clip-end">OUT</label><input id="clip-end" class="clip-time" type="text" value="00:00:00.000" placeholder="00:00:00.000" aria-describedby="clip-time-hint"><button id="set-clip-end" class="text-button" type="button">Set out at playhead</button></div>
               </div>
               <div class="clip-actions">
                 <button id="preview-clip" class="button button-secondary" type="button" disabled>Preview clip</button>
@@ -81,7 +81,7 @@
                 <a id="save-clip" class="button button-primary" hidden>Save MP4 <span aria-hidden="true">↓</span></a>
               </div>
             </div>
-            <p id="clip-time-hint" class="field-hint">Hours:minutes:seconds.milliseconds · end must be after start. Preview the range before exporting.</p>
+            <p id="clip-time-hint" class="field-hint">Set a start and end, then preview your clip.</p>
             <p id="clip-error" class="settings-error" role="alert" hidden></p>
             <progress id="clip-export-progress" aria-label="Clip export progress" hidden></progress>
             <p id="clip-export-status" class="field-hint" role="status" hidden></p>
@@ -94,8 +94,8 @@
           <p class="finder-intro">Describe a moment. Jump straight to it.</p>
           <form id="search-form">
             <div class="query-heading"><label for="scene-query">What happens in the scene?</label><kbd id="query-shortcut" class="timecode" hidden></kbd></div>
-            <textarea id="scene-query" rows="4" maxlength="2000" placeholder="A person waiting under a streetlight in the rain…" aria-describedby="query-hint" required disabled></textarea>
-            <p id="query-hint" class="field-hint">Describe what you can see: people, places, actions, or colors.</p>
+            <textarea id="scene-query" rows="3" maxlength="2000" placeholder="A person waiting under a streetlight in the rain…" aria-describedby="query-hint" required disabled></textarea>
+            <p id="query-hint" class="field-hint">Describe a visible detail, action, or object.</p>
             <button id="search-button" class="button button-primary" type="submit" disabled><span>Find the scene</span><svg width="18" height="18" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.5" cy="10.5" r="6.5" fill="none" stroke="currentColor" stroke-width="1.8"/><path d="m16 16 4 4" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/></svg></button>
           </form>
           <div id="search-progress-panel" class="search-progress-panel" hidden>
