@@ -6,6 +6,7 @@ const settings = require('./settings.cjs');
 
 app.setName('Scene Finder');
 let window, backend, origin, quitting = false;
+let movieOpen;
 const hasLock = app.requestSingleInstanceLock();
 if (!hasLock) app.quit();
 else {
@@ -18,6 +19,10 @@ else {
 
 function isOwnUrl(value) {
   try { return new URL(value).origin === origin; } catch { return false; }
+}
+
+function assertSender(event) {
+  if (event.sender !== window?.webContents || event.senderFrame !== window.webContents.mainFrame || !isOwnUrl(event.senderFrame.url)) throw new Error('This action is unavailable.');
 }
 
 async function start() {
@@ -54,10 +59,37 @@ async function start() {
 
   for (const [channel, handler] of Object.entries({ 'settings:get': settings.getSettings, 'settings:save': settings.saveApiKey, 'settings:clear': settings.clearApiKey, 'appearance:get': settings.getAppearance, 'appearance:set': settings.setAppearance })) {
     ipcMain.handle(channel, async (event, value) => {
-      if (event.sender !== window?.webContents || event.senderFrame !== window.webContents.mainFrame || !isOwnUrl(event.senderFrame.url)) throw new Error('This action is unavailable.');
+      assertSender(event);
       return handler(value);
     });
   }
+  ipcMain.handle('movies:open', async (event, filePath, requestId) => {
+    assertSender(event);
+    if (typeof requestId !== 'string' || requestId.length > 80 || typeof filePath !== 'string' || !path.isAbsolute(filePath)) throw new Error('Choose a movie from this device.');
+    movieOpen?.controller.abort();
+    const operation = { requestId, controller: new AbortController() };
+    movieOpen = operation;
+    try {
+      const movie = await backend.openMovie(filePath, operation.controller.signal, percent => {
+        if (movieOpen === operation && !event.sender.isDestroyed()) event.sender.send('movies:progress', { requestId, percent });
+      });
+      return { movie };
+    } catch (error) {
+      if (operation.controller.signal.aborted || error.name === 'AbortError') return { cancelled: true };
+      const message = error.code === 'INSUFFICIENT_DISK_SPACE' || error.code === 'ENOSPC'
+        ? 'Free up disk space to prepare a playback copy of this movie.'
+        : error.code === 'ENOENT' || error.code === 'EACCES'
+          ? 'The movie could not be read. Check that the file or external drive is still available.'
+          : 'This movie could not be opened. Choose a valid MP4 or MKV file and try again.';
+      return { error: { message } };
+    } finally {
+      if (movieOpen === operation) movieOpen = null;
+    }
+  });
+  ipcMain.handle('movies:cancel', (event, requestId) => {
+    assertSender(event);
+    if (movieOpen?.requestId === requestId) movieOpen.controller.abort();
+  });
   Menu.setApplicationMenu(Menu.buildFromTemplate([
     ...(process.platform === 'darwin' ? [{ role: 'appMenu' }] : []),
     { role: 'editMenu' }, { role: 'viewMenu' }, { role: 'windowMenu' },

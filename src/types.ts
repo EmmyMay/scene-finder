@@ -46,6 +46,7 @@ export interface SearchResponsePayload {
   sampleStepSeconds: number;
   results: SceneResult[];
   error?: SearchError;
+  retrying?: boolean;
 }
 
 export interface ExtractedFrame {
@@ -66,6 +67,7 @@ export interface FrameWindowScoreInput {
   query: string;
   frames: ExtractedFrame[];
   signal: AbortSignal;
+  onRetry?: (retrying: boolean) => void;
 }
 
 export interface JevScorer {

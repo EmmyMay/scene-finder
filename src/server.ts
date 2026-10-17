@@ -14,6 +14,7 @@ import {
   DEFAULT_MAX_SAMPLED_FRAMES,
   exportMovieClip,
   extractSampledFrames,
+  isDirectlyPlayableMovie,
   moveFileCrossDevice,
   preparePlayableMovie,
   probeVideoFile
@@ -24,6 +25,7 @@ import type {
   HealthResponse,
   JevScorer,
   MovieRecord,
+  MovieMetadata,
   SceneResult,
   ScoredFrame,
   SearchError,
@@ -59,6 +61,7 @@ export interface RunningBackendServer {
   host: string;
   port: number;
   url: string;
+  openMovie(filePath: string, signal?: AbortSignal, onProgress?: (percent: number) => void): Promise<MovieMetadata>;
   close(): Promise<void>;
 }
 
@@ -71,6 +74,8 @@ interface InternalSearchJob {
   total: number;
   sampleStepSeconds: number;
   results: SceneResult[];
+  scoredFrames: ScoredFrame[];
+  retrying: boolean;
   error?: SearchError;
   framesDir: string;
   abortController: AbortController;
@@ -93,6 +98,7 @@ function sanitizeAttachmentStem(name: string): string {
 
 export function createApp(options: BackendServerOptions = {}): {
   app: express.Express;
+  openMovie: RunningBackendServer["openMovie"];
   cancelAllSearches(): void;
   waitForActiveOperations(): Promise<void>;
 } {
@@ -185,7 +191,7 @@ export function createApp(options: BackendServerOptions = {}): {
       inFlightOperations.delete(tracked);
     });
     inFlightOperations.add(tracked);
-    return promise;
+    return tracked;
   }
 
   function trackReadStream(stream: fs.ReadStream): fs.ReadStream {
@@ -226,6 +232,53 @@ export function createApp(options: BackendServerOptions = {}): {
 
   const app = express();
   app.disable("x-powered-by");
+
+  // Main-process API only. Never accept local paths through an HTTP endpoint.
+  const openMovie: RunningBackendServer["openMovie"] = (filePath, signal, onProgress) => {
+    for (const controller of activePrepareControllers) controller.abort();
+    const controller = new AbortController();
+    activePrepareControllers.add(controller);
+    const operationSignal = signal ? AbortSignal.any([signal, controller.signal]) : controller.signal;
+    return trackOperation((async () => {
+      const movieId = `mov_${crypto.randomUUID().replace(/-/g, "").slice(0, 16)}`;
+      const movieDir = path.join(moviesBaseDir, movieId);
+      try {
+        operationSignal.throwIfAborted();
+        if (typeof filePath !== "string" || !path.isAbsolute(filePath)) throw new AppError("INVALID_MOVIE", "Choose a movie on this device.");
+        const sourcePath = await fsp.realpath(filePath);
+        const stat = await fsp.stat(sourcePath);
+        if (!stat.isFile()) throw new AppError("INVALID_MOVIE", "Choose a movie file, not a folder.");
+        const probed = await probeVideoFile(sourcePath, ffprobeBin, operationSignal);
+        operationSignal.throwIfAborted();
+        await fsp.mkdir(movieDir, { recursive: true });
+        if (!isDirectlyPlayableMovie(sourcePath, probed)) {
+          const disk = await fsp.statfs(movieDir, { bigint: true });
+          // A preflight reserve, not an exact codec-dependent output-size prediction.
+          if (disk.bavail * disk.bsize < BigInt(stat.size) + 256n * 1024n * 1024n) {
+            throw new AppError("INSUFFICIENT_DISK_SPACE", "Free up disk space to prepare a playback copy of this movie.", 507);
+          }
+        }
+        const prepared = await preparePlayableMovie({
+          sourcePath, playableOutputPath: path.join(movieDir, "playable.mp4"), probed,
+          ffmpegBin, ffprobeBin, signal: operationSignal,
+          onProgress: seconds => onProgress?.(Math.min(99, Math.floor(seconds / probed.durationSeconds * 100))),
+        });
+        operationSignal.throwIfAborted();
+        const metadata: MovieMetadata = { id: movieId, name: path.basename(sourcePath),
+          durationSeconds: prepared.probed.durationSeconds, width: prepared.probed.width,
+          height: prepared.probed.height, mediaUrl: `/api/movies/${movieId}/media` };
+        movies.set(movieId, { ...metadata, sourceFilePath: sourcePath, filePath: prepared.playablePath,
+          mimeType: "video/mp4", hasAudio: prepared.probed.hasAudio });
+        return metadata;
+      } catch (error) {
+        // Only our generated directory is owned. The selected original is never moved or deleted.
+        await fsp.rm(movieDir, { recursive: true, force: true }).catch(() => undefined);
+        throw error;
+      } finally {
+        activePrepareControllers.delete(controller);
+      }
+    })());
+  };
 
   app.use("/api", (req: Request, res: Response, next: NextFunction) => {
     if (!apiToken) {
@@ -712,6 +765,8 @@ export function createApp(options: BackendServerOptions = {}): {
         total: 0,
         sampleStepSeconds,
         results: [],
+        scoredFrames: [],
+        retrying: false,
         framesDir,
         abortController
       };
@@ -819,7 +874,7 @@ export function createApp(options: BackendServerOptions = {}): {
 
     try {
       if (isCancelled()) {
-        job.status = "cancelled";
+        if (job.abortController.signal === signal) job.status = "cancelled";
         return;
       }
 
@@ -836,7 +891,7 @@ export function createApp(options: BackendServerOptions = {}): {
       const extractedFrames = await extractFramesWithCacheReuse(job, movie);
 
       if (isCancelled()) {
-        job.status = "cancelled";
+        if (job.abortController.signal === signal) job.status = "cancelled";
         return;
       }
 
@@ -849,15 +904,15 @@ export function createApp(options: BackendServerOptions = {}): {
       }
 
       job.total = extractedFrames.length;
-      job.processed = 0;
+      job.processed = job.scoredFrames.length;
       job.status = "searching";
 
       const windowSize = Math.max(1, baseConfig.windowSize);
-      const scoredFrames: ScoredFrame[] = [];
+      const scoredFrames = job.scoredFrames;
 
-      for (let i = 0; i < extractedFrames.length; i += windowSize) {
+      for (let i = scoredFrames.length; i < extractedFrames.length; i += windowSize) {
         if (isCancelled()) {
-          job.status = "cancelled";
+          if (job.abortController.signal === signal) job.status = "cancelled";
           return;
         }
 
@@ -867,14 +922,16 @@ export function createApp(options: BackendServerOptions = {}): {
           movieName: movie.name,
           query: job.query,
           frames: windowFrames,
-          signal
+          signal,
+          onRetry: retrying => { if (job.abortController.signal === signal) job.retrying = retrying; }
         });
 
         if (isCancelled()) {
-          job.status = "cancelled";
+          if (job.abortController.signal === signal) job.status = "cancelled";
           return;
         }
 
+        const completedWindow: ScoredFrame[] = [];
         for (const frame of windowFrames) {
           const score = windowScores[frame.id];
           if (typeof score !== "number" || !Number.isFinite(score)) {
@@ -884,11 +941,12 @@ export function createApp(options: BackendServerOptions = {}): {
               502
             );
           }
-          scoredFrames.push({
+          completedWindow.push({
             ...frame,
             noul: score
           });
         }
+        scoredFrames.push(...completedWindow);
 
         job.processed = scoredFrames.length;
         job.results = groupFramesIntoScenes(scoredFrames, {
@@ -899,14 +957,14 @@ export function createApp(options: BackendServerOptions = {}): {
       }
 
       if (isCancelled()) {
-        job.status = "cancelled";
+        if (job.abortController.signal === signal) job.status = "cancelled";
         return;
       }
 
       job.status = "completed";
     } catch (err) {
       if (isCancelled() || (err instanceof Error && err.name === "AbortError")) {
-        job.status = "cancelled";
+        if (job.abortController.signal === signal) job.status = "cancelled";
         return;
       }
 
@@ -918,8 +976,25 @@ export function createApp(options: BackendServerOptions = {}): {
         code,
         message: redactSecrets(rawMessage, [getCurrentApiKey(), apiToken])
       };
+    } finally {
+      if (job.abortController.signal === signal) job.retrying = false;
     }
   }
+
+  app.post("/api/searches/:searchId/resume", (req: Request, res: Response) => {
+    const job = searches.get(String(req.params.searchId));
+    if (!job) { res.status(404).json({ error: { code: "SEARCH_NOT_FOUND" } }); return; }
+    if (job.status !== "failed" && job.status !== "cancelled") {
+      res.status(409).json({ error: { code: "SEARCH_ALREADY_RUNNING" } }); return;
+    }
+    const movie = movies.get(job.movieId);
+    if (!movie) { res.status(404).json({ error: { code: "MOVIE_NOT_FOUND" } }); return; }
+    job.abortController = new AbortController();
+    job.status = "queued";
+    job.error = undefined;
+    void trackOperation(runSearchPipeline(job, movie));
+    res.status(202).json({ searchId: job.id });
+  });
 
   // GET /api/searches/:searchId
   app.get("/api/searches/:searchId", (req: Request, res: Response) => {
@@ -943,7 +1018,8 @@ export function createApp(options: BackendServerOptions = {}): {
       processed: job.processed,
       total: job.total,
       sampleStepSeconds: job.sampleStepSeconds,
-      results: job.results
+      results: job.results,
+      retrying: job.retrying
     };
 
     if (job.error) {
@@ -1082,7 +1158,7 @@ export function createApp(options: BackendServerOptions = {}): {
     await Promise.allSettled([...inFlightOperations]);
   };
 
-  return { app, cancelAllSearches, waitForActiveOperations };
+  return { app, openMovie, cancelAllSearches, waitForActiveOperations };
 }
 
 export async function startServer(
@@ -1092,7 +1168,7 @@ export async function startServer(
   const requestedPort =
     options.port !== undefined ? options.port : Number(process.env.PORT ?? 3000) || 3000;
 
-  const { app, cancelAllSearches, waitForActiveOperations } = createApp(options);
+  const { app, openMovie, cancelAllSearches, waitForActiveOperations } = createApp(options);
   const server = http.createServer(app);
   const sockets = new Set<Socket>();
 
@@ -1146,6 +1222,7 @@ export async function startServer(
 
   return {
     app,
+    openMovie,
     server,
     host: boundHost,
     port: boundPort,

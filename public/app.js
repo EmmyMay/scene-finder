@@ -8,7 +8,7 @@ const ui = Object.fromEntries([
   "contact-empty", "contact-strip", "search-form", "scene-query", "search-button",
   "search-progress-panel", "search-phase", "cancel-search", "search-progress",
   "search-count", "results-heading", "results-count", "results-status", "results-list",
-  "sample-note", "settings-button", "settings-dialog", "close-settings", "settings-form",
+  "sample-note", "resume-search", "settings-button", "settings-dialog", "close-settings", "settings-form",
   "api-key", "connection-status", "settings-error", "save-connection", "remove-connection",
   "cleanup-notice", "cleanup-message", "retry-cleanup",
   "clip-editor", "clip-duration", "clip-start", "clip-end", "set-clip-start", "set-clip-end",
@@ -20,6 +20,7 @@ const state = { generation: 0, movie: null, upload: null, run: null, ready: fals
 const player = ui["movie-player"];
 const desktop = globalThis.sceneFinderDesktop;
 const hasDesktopSettings = desktop && ["getSettings", "saveApiKey", "clearApiKey"].every(method => typeof desktop[method] === "function");
+const hasDirectFileOpening = desktop && ["openMovie", "cancelOpenMovie", "onMovieProgress"].every(method => typeof desktop[method] === "function");
 const hasConnectionUpdates = hasDesktopSettings && typeof desktop.onConnectionChanged === "function";
 const connection = { configured: false, loaded: false, busy: false, loading: Boolean(hasConnectionUpdates), refreshPending: false, readError: false };
 // Detached jobs outlive the active movie until cancellation is confirmed.
@@ -46,13 +47,15 @@ function notice(message = "") {
 }
 
 function resultStatus(message) {
-  ui["results-status"].textContent = message;
+  if (ui["results-status"].textContent !== message) ui["results-status"].textContent = message;
   ui["results-status"].hidden = !message;
 }
 
 function updateControls() {
   ui["scene-query"].disabled = !state.movie || Boolean(state.upload || state.run);
   ui["search-button"].disabled = !state.movie || !state.ready || Boolean(state.upload || state.run) || pendingCleanup.size > 0 || !ui["scene-query"].value.trim();
+  ui["resume-search"].hidden = !state.resume || state.resume.query !== ui["scene-query"].value.trim();
+  ui["resume-search"].disabled = !state.ready || Boolean(state.run || state.upload) || pendingCleanup.size > 0;
   ui["search-form"].setAttribute("aria-busy", String(Boolean(state.run)));
 }
 
@@ -77,6 +80,9 @@ async function request(path, options = {}) {
 }
 
 function errorMessage(error, action) {
+  if (error.code === "JEV_TIMEOUT") return "Jev took too long to respond. Your matches are kept; retry the remaining frames.";
+  if (error.code === "JEV_RATE_LIMITED") return "Jev is limiting requests. Wait a moment, then retry the remaining frames.";
+  if (error.code === "FRAME_BUDGET_EXCEEDED") return "This movie is too long for the current search limit. Choose a video shorter than 133 minutes.";
   if (error.status === 413) return "This movie is too large to upload. Choose a smaller video and try again.";
   if (error.status === 415 || /invalid_video|unsupported|probe/i.test(error.code || "")) return "This file could not be read as a movie. Choose a valid MKV or MP4 file and try again.";
   if (error.status === 429) return "Scene search is busy. Wait a moment, then try again.";
@@ -228,6 +234,8 @@ if (hasDesktopSettings) {
 }
 
 function clearResults() {
+  state.resume = null;
+  ui["resume-search"].hidden = true;
   state.results = [];
   ui["results-list"].replaceChildren();
   ui["contact-strip"].replaceChildren();
@@ -344,8 +352,68 @@ function resetMovie() {
   updateControls();
 }
 
+function showMovie(movie, source = mediaUrl(movie.mediaUrl)) {
+    state.upload = null;
+    state.movie = movie;
+    state.duration = movie.durationSeconds;
+    ui["upload-state"].hidden = true;
+    ui["replace-movie"].hidden = false;
+    player.hidden = false;
+    player.src = source;
+    player.load();
+    ui["movie-name"].textContent = movie.name;
+    ui["movie-details"].textContent = [timecode(movie.durationSeconds), movie.width && movie.height ? `${movie.width} × ${movie.height}` : ""].filter(Boolean).join(" · ");
+    ui["timeline-end"].textContent = timecode(state.duration);
+    ui["playback-time"].textContent = `00:00 / ${timecode(state.duration)}`;
+    seedClip({ startSeconds: 0, endSeconds: Math.min(5, state.duration) });
+    ui["clip-editor"].hidden = false;
+    resultStatus("Describe a scene to find matching moments.");
+    updateControls();
+    ui["scene-query"].focus();
+    checkHealth();
+}
+
+async function openLocalMovie(file) {
+  notice();
+  resetMovie();
+  const requestId = crypto.randomUUID();
+  const operation = { generation: state.generation, requestId,
+    abort: () => { void desktop.cancelOpenMovie(requestId).catch(() => {}); } };
+  state.upload = operation;
+  ui["upload-name"].textContent = file.name;
+  ui["upload-label"].textContent = "Opening movie…";
+  ui["upload-percent"].textContent = "";
+  ui["upload-progress"].removeAttribute("value");
+  ui["upload-empty"].hidden = true;
+  ui["upload-state"].hidden = false;
+  resultStatus("Opening your movie from this device.");
+  updateControls();
+  try {
+    const result = await desktop.openMovie(file, requestId);
+    if (state.upload !== operation || state.generation !== operation.generation) return;
+    if (result.cancelled) { resetMovie(); return; }
+    if (result.error) throw new Error(result.error.message);
+    const movie = result.movie;
+    if (!movie?.id || !Number.isFinite(movie.durationSeconds) || movie.durationSeconds <= 0) throw new Error("The movie could not be opened.");
+    showMovie(movie);
+  } catch (error) {
+    if (state.upload !== operation || state.generation !== operation.generation) return;
+    resetMovie();
+    notice(bridgeError(error));
+    resultStatus("Choose a movie to get started.");
+  }
+}
+
+if (hasDirectFileOpening) desktop.onMovieProgress(({ requestId, percent }) => {
+  if (state.upload?.requestId !== requestId || !Number.isFinite(percent)) return;
+  ui["upload-label"].textContent = "Preparing a playback copy…";
+  ui["upload-percent"].textContent = `${percent}%`;
+  ui["upload-progress"].value = percent;
+});
+
 function uploadMovie(file) {
   if (!file) return;
+  if (hasDirectFileOpening) { void openLocalMovie(file); return; }
   notice();
   resetMovie();
   const generation = state.generation;
@@ -403,24 +471,7 @@ function uploadMovie(file) {
       if (!movie?.id || !Number.isFinite(movie.durationSeconds) || movie.durationSeconds <= 0) throw new Error();
       source = mediaUrl(movie.mediaUrl);
     } catch { fail("The movie could not be prepared. Choose the file again."); return; }
-    state.upload = null;
-    state.movie = movie;
-    state.duration = movie.durationSeconds;
-    ui["upload-state"].hidden = true;
-    ui["replace-movie"].hidden = false;
-    player.hidden = false;
-    player.src = source;
-    player.load();
-    ui["movie-name"].textContent = movie.name || file.name;
-    ui["movie-details"].textContent = [timecode(movie.durationSeconds), movie.width && movie.height ? `${movie.width} × ${movie.height}` : ""].filter(Boolean).join(" · ");
-    ui["timeline-end"].textContent = timecode(state.duration);
-    ui["playback-time"].textContent = `00:00 / ${timecode(state.duration)}`;
-    seedClip({ startSeconds: 0, endSeconds: Math.min(5, state.duration) });
-    ui["clip-editor"].hidden = false;
-    resultStatus("Describe a scene to find matching moments.");
-    updateControls();
-    ui["scene-query"].focus();
-    checkHealth();
+    showMovie(movie, source);
   });
   xhr.addEventListener("error", () => fail("The movie could not be uploaded. Check your connection and try again."));
   xhr.open("POST", "/api/movies");
@@ -453,7 +504,10 @@ async function cancelSearch(run = state.run) {
   run.controller?.abort();
   try {
     await deleteSearch(run);
-    finishSearch(run, "Search cancelled. Change the description and try again.");
+    if (!isCurrent(run)) return;
+    state.resume = run;
+    ui["resume-search"].textContent = "Continue searching";
+    finishSearch(run, "Search stopped. Your matching moments are kept.");
   } catch {
     if (!isCurrent(run)) return;
     run.cancelRequested = false;
@@ -649,55 +703,96 @@ ui["cancel-clip-export"].addEventListener("click", () => { resetClipExport("Clip
 player.addEventListener("pause", () => { clip.previewing = false; updateClipControls(); });
 
 function renderResults(results, step) {
-  clearResults();
+  // Keep scene positions stable as scores/peaks change. Updating results never seeks,
+  // reseeds an edited trim, clears an export, or replaces a focused result button.
+  const previousOrder = new Map(state.results.map((result, i) => [result.startSeconds, i]));
+  results.sort((a, b) => (previousOrder.get(a.startSeconds) ?? Infinity) - (previousOrder.get(b.startSeconds) ?? Infinity) || b.score - a.score);
   state.results = results;
   ui["results-count"].textContent = String(results.length);
   ui["results-count"].hidden = false;
-  for (const [index, result] of results.entries()) {
-    const button = element("button", "result");
-    button.type = "button";
-    button.dataset.resultId = String(result.id);
-    button.setAttribute("aria-label", `Jump to matching moment ${index + 1}, ${rangeLabel(result)}`);
-    const img = element("img");
-    img.src = result.thumbnailUrl;
-    img.alt = "";
-    img.loading = "lazy";
-    const copy = element("span", "result-copy");
-    copy.append(element("strong", "", `Moment ${String(index + 1).padStart(2, "0")}`), element("span", "timecode", rangeLabel(result)));
-    const arrow = element("span", "result-arrow", "↗");
-    arrow.setAttribute("aria-hidden", "true");
-    button.append(img, copy, arrow);
-    button.addEventListener("click", () => seekTo(result));
-    ui["results-list"].append(button);
+  function reconcile(parent, ordered, kind) {
+    const existing = new Map([...parent.children].map(node => [Number(node.dataset.sceneStart), node]));
+    ordered.forEach((result, index) => {
+      let button = existing.get(result.startSeconds);
+      existing.delete(result.startSeconds);
+      if (!button) {
+        button = element("button", kind);
+        button.type = "button";
+        button.dataset.sceneStart = String(result.startSeconds);
+        if (kind !== "timeline-marker") {
+          const img = element("img"); img.alt = ""; img.loading = "lazy";
+          button.append(img);
+          if (kind === "result") {
+            const copy = element("span", "result-copy");
+            copy.append(element("strong"), element("span", "timecode"));
+            const arrow = element("span", "result-arrow", "↗"); arrow.setAttribute("aria-hidden", "true");
+            button.append(copy, arrow);
+          } else button.append(element("span", "timecode"));
+        }
+        button.addEventListener("click", () => {
+          const match = button.sceneResult;
+          seekTo(kind === "result" ? match : { ...match, startSeconds: match.peakTimestampSeconds });
+        });
+      }
+      button.sceneResult = result;
+      button.dataset.resultId = String(result.id);
+      button.setAttribute("aria-label", kind === "result" ? `Jump to matching moment ${index + 1}, ${rangeLabel(result)}` : `Jump to matching frame at ${timecode(result.peakTimestampSeconds)}`);
+      if (kind === "timeline-marker") button.style.left = `${Math.min(100, result.peakTimestampSeconds / state.duration * 100)}%`;
+      else {
+        const img = button.querySelector("img");
+        if (img.src !== result.thumbnailUrl) img.src = result.thumbnailUrl;
+        button.querySelector(".timecode").textContent = kind === "result" ? rangeLabel(result) : timecode(result.peakTimestampSeconds);
+        if (kind === "result") button.querySelector("strong").textContent = `Moment ${String(index + 1).padStart(2, "0")}`;
+      }
+      if (parent.children[index] !== button) parent.insertBefore(button, parent.children[index] || null);
+    });
+    for (const stale of existing.values()) stale.remove();
   }
-  for (const result of [...results].sort((a, b) => a.peakTimestampSeconds - b.peakTimestampSeconds)) {
-    const contact = element("button", "contact");
-    contact.type = "button";
-    contact.dataset.resultId = String(result.id);
-    contact.setAttribute("aria-label", `Jump to matching frame at ${timecode(result.peakTimestampSeconds)}`);
-    const img = element("img");
-    img.src = result.thumbnailUrl;
-    img.alt = "";
-    img.loading = "lazy";
-    contact.append(img, element("span", "timecode", timecode(result.peakTimestampSeconds)));
-    // The contact image depicts the peak frame; the result card seeks to its first hit.
-    contact.addEventListener("click", () => seekTo({ ...result, startSeconds: result.peakTimestampSeconds }));
-    ui["contact-strip"].append(contact);
-    const marker = element("button", "timeline-marker");
-    marker.type = "button";
-    marker.dataset.resultId = String(result.id);
-    marker.style.left = `${Math.min(100, result.peakTimestampSeconds / state.duration * 100)}%`;
-    marker.setAttribute("aria-label", `Jump to matching frame at ${timecode(result.peakTimestampSeconds)}`);
-    marker.addEventListener("click", () => seekTo({ ...result, startSeconds: result.peakTimestampSeconds }));
-    ui["timeline-markers"].append(marker);
-  }
+  reconcile(ui["results-list"], results, "result");
+  const chronological = [...results].sort((a, b) => a.startSeconds - b.startSeconds);
+  reconcile(ui["contact-strip"], chronological, "contact");
+  reconcile(ui["timeline-markers"], chronological, "timeline-marker");
   ui["contact-strip"].hidden = results.length === 0;
   ui["contact-empty"].hidden = results.length > 0;
+  ui["sample-note"].hidden = results.length === 0;
   if (results.length > 0) {
     ui["sample-note"].textContent = `Matching sampled frames${Number.isFinite(step) && step > 0 ? ` · checked every ${step}s` : ""}. Times show observed matches, not exact scene boundaries.`;
-    ui["sample-note"].hidden = false;
+    ui["results-list"].setAttribute("aria-busy", "false");
   }
 }
+
+async function resumeSearch() {
+  if (!state.resume || state.run || state.upload || !state.ready || pendingCleanup.size) return;
+  if (state.resume.query !== ui["scene-query"].value.trim()) return;
+  const previous = state.resume;
+  // Wait for the resume response before cancelling, so DELETE cannot overtake POST.
+  const run = { generation: state.generation, id: null, query: previous.query, cancelRequested: false };
+  state.resume = null;
+  state.run = run;
+  notice();
+  ui["search-progress-panel"].hidden = false;
+  ui["cancel-search"].disabled = false;
+  setPhase("Continuing your search…");
+  updateControls();
+  try {
+    await request(`/api/searches/${encodeURIComponent(previous.id)}/resume`, { method: "POST" });
+    run.id = previous.id;
+    if (!isCurrent(run)) { queueCleanup(run); return; }
+    if (run.cancelRequested) { cancelSearch(run); return; }
+    pollSearch(run);
+  } catch (error) {
+    run.id = previous.id;
+    if (!isCurrent(run)) { queueCleanup(run); return; }
+    if (run.cancelRequested) { cancelSearch(run); return; }
+    if (error.status === 404) {
+      finishSearch(run, "This search is no longer available. Start a new search.");
+      return;
+    }
+    // A lost response may still have resumed the job: observe its state before retrying.
+    pollSearch(run);
+  }
+}
+ui["resume-search"].addEventListener("click", resumeSearch);
 
 async function pollSearch(run) {
   if (!isCurrent(run) || run.cancelRequested) return;
@@ -707,21 +802,28 @@ async function pollSearch(run) {
     if (!isCurrent(run) || run.cancelRequested) return;
     if (search.movieId !== state.movie.id || search.id !== run.id) throw new Error("Invalid search response");
     run.failures = 0;
-    if (search.status === "completed") {
-      const results = validResults(search.results);
+    const results = validResults(search.results);
+    const signature = JSON.stringify(results);
+    if (run.resultsSignature !== signature) {
       renderResults(results, search.sampleStepSeconds);
+      run.resultsSignature = signature;
+    }
+    if (search.status === "completed") {
       finishSearch(run, results.length ? `${results.length} matching ${results.length === 1 ? "moment" : "moments"}. Select one to jump there.` : "No matching moments found. Try a different description with visible details from the scene.");
       return;
     }
     if (search.status === "failed") {
-      finishSearch(run, "Search could not finish. You can try again.");
+      state.resume = run;
+      ui["resume-search"].textContent = "Retry remaining frames";
+      finishSearch(run, "Search paused. Your matching moments are kept.");
       notice(errorMessage({ code: search.error?.code }, "The scene search could not finish."));
       return;
     }
-    if (search.status === "cancelled") { finishSearch(run, "Search cancelled. Change the description and try again."); return; }
+    if (search.status === "cancelled") { state.resume = run; ui["resume-search"].textContent = "Continue searching"; finishSearch(run, "Search stopped. Your matching moments are kept."); return; }
     const phases = { queued: "Waiting to search…", extracting: "Reading your movie…", searching: "Looking for your scene…" };
     if (!phases[search.status]) throw new Error("Unknown search status");
-    setPhase(phases[search.status]);
+    setPhase(search.retrying ? "Jev is busy. Retrying shortly…" : phases[search.status]);
+    if (results.length) resultStatus(`${results.length} matching ${results.length === 1 ? "moment" : "moments"} so far. You can play or clip one while the search continues.`);
     const total = Number(search.total);
     const processed = Math.max(0, Number(search.processed) || 0);
     if (search.status === "searching" && Number.isFinite(total) && total > 0) {
@@ -758,7 +860,7 @@ async function startSearch(event) {
   if (!state.movie || state.upload || state.run || pendingCleanup.size > 0 || !state.ready || !query) return;
   notice();
   clearResults();
-  const run = { generation: state.generation, id: null, cancelRequested: false };
+  const run = { generation: state.generation, id: null, query, cancelRequested: false };
   state.run = run;
   ui["search-progress-panel"].hidden = false;
   ui["cancel-search"].disabled = false;
@@ -797,7 +899,7 @@ async function startSearch(event) {
 ui["choose-movie"].addEventListener("click", () => ui["movie-file"].click());
 ui["replace-movie"].addEventListener("click", () => ui["movie-file"].click());
 ui["movie-file"].addEventListener("change", event => { uploadMovie(event.target.files[0]); event.target.value = ""; });
-ui["cancel-upload"].addEventListener("click", () => { resetMovie(); resultStatus("Upload cancelled. Choose a movie when you’re ready."); });
+ui["cancel-upload"].addEventListener("click", () => { resetMovie(); resultStatus("Opening cancelled. Choose a movie when you’re ready."); });
 ui["search-form"].addEventListener("submit", startSearch);
 ui["scene-query"].addEventListener("input", updateControls);
 const platform = globalThis.navigator?.userAgentData?.platform || globalThis.navigator?.platform || "";

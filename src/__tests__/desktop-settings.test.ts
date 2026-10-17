@@ -3,6 +3,46 @@ import vm from 'node:vm';
 import path from 'node:path';
 import { expect, it } from 'vitest';
 
+it('opens only OS-backed File objects through preload and does not expose IPC events', async () => {
+  type Bridge = {
+    openMovie: (file: unknown, requestId: string) => Promise<unknown>;
+    onMovieProgress: (callback: (progress: unknown) => void) => () => void;
+  };
+  let bridge!: Bridge;
+  let listener!: (event: unknown, progress: unknown) => void;
+  const calls: unknown[][] = [];
+  const selectedFile = {};
+  vm.runInNewContext(readFileSync('desktop/preload.cjs', 'utf8'), {
+    require: (name: string) => {
+      if (name !== 'electron') throw new Error(`Unexpected module ${name}`);
+      return {
+        contextBridge: { exposeInMainWorld: (_name: string, api: Bridge) => { bridge = api; } },
+        webUtils: { getPathForFile: (file: unknown) => {
+          if (typeof file === 'string') throw new TypeError('Expected File');
+          return file === selectedFile ? '/selected/movie.mp4' : '';
+        } },
+        ipcRenderer: {
+          invoke: async (...args: unknown[]) => { calls.push(args); return { movie: { id: 'movie' } }; },
+          on: (_channel: string, callback: typeof listener) => { listener = callback; },
+          removeListener: (...args: unknown[]) => { calls.push(args); },
+        },
+      };
+    },
+  });
+  expect(() => bridge.openMovie('/unselected/private.mp4', '1')).toThrow();
+  expect(() => bridge.openMovie({ path: '/unselected/private.mp4' }, '2')).toThrow();
+  expect(calls).toHaveLength(0);
+  await expect(bridge.openMovie(selectedFile, '3')).resolves.toEqual({ movie: { id: 'movie' } });
+  expect(calls).toEqual([['movies:open', '/selected/movie.mp4', '3']]);
+  const received: unknown[] = [];
+  const unsubscribe = bridge.onMovieProgress(value => received.push(value));
+  const progress = { requestId: '3', percent: 45 };
+  listener({ sender: 'privileged IPC event' }, progress);
+  expect(received).toEqual([progress]);
+  unsubscribe();
+  expect(calls[1]).toEqual(['movies:progress', listener]);
+});
+
 it('serializes connection changes and safely uses a session key when secure storage is unavailable', async () => {
   let finishValidation!: (response: { ok: boolean; status: number }) => void;
   let validationStarted!: () => void;

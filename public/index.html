@@ -44,7 +44,7 @@
         <section class="movie-panel" aria-labelledby="movie-name">
           <input id="movie-file" type="file" accept="video/*,.mkv,.mov,.mp4,.webm,.avi" hidden>
           <div id="drop-zone" class="player-stage">
-            <video id="movie-player" controls playsinline preload="metadata" aria-label="Your uploaded movie" hidden></video>
+            <video id="movie-player" controls playsinline preload="metadata" aria-label="Your movie" hidden></video>
             <div id="upload-empty" class="upload-empty">
               <svg class="upload-symbol" viewBox="0 0 64 64" width="64" height="64" aria-hidden="true"><rect x="9" y="8" width="46" height="48" rx="10" fill="none" stroke="currentColor" stroke-width="1.5"/><path d="M20 8v48M44 8v48M9 21h11M9 43h11M44 21h11M44 43h11M27 27l10 6-10 6z" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linejoin="round"/></svg>
               <h3>Choose your movie</h3>
@@ -55,8 +55,8 @@
             <div id="upload-state" class="upload-state" hidden>
               <p class="eyebrow">BRINGING IN YOUR MOVIE</p><h3 id="upload-name"></h3>
               <div class="progress-heading"><span id="upload-label" role="status">Uploading movie…</span><span id="upload-percent" class="timecode"></span></div>
-              <progress id="upload-progress" max="100" value="0" aria-label="Movie upload progress"></progress>
-              <button id="cancel-upload" class="text-button" type="button">Cancel upload</button>
+              <progress id="upload-progress" max="100" value="0" aria-label="Movie opening progress"></progress>
+              <button id="cancel-upload" class="text-button" type="button">Cancel opening</button>
             </div>
             <div class="drop-hint" aria-hidden="true">Drop to change movie</div>
           </div>
@@ -106,6 +106,7 @@
           <section class="results-panel" aria-labelledby="results-heading">
             <div class="results-heading"><h3 id="results-heading">Matching moments</h3><span id="results-count" class="result-count" hidden></span></div>
             <p id="results-status" class="results-status" role="status">Choose a movie to get started.</p>
+            <button id="resume-search" class="text-button" type="button" hidden>Retry remaining frames</button>
             <div id="results-list" class="results-list"></div>
             <p id="sample-note" class="sample-note" hidden></p>
           </section>
