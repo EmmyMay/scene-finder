@@ -1,5 +1,6 @@
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import { setTimeout as delay } from "node:timers/promises";
 import { AppError, redactSecrets } from "./env.js";
 import type { FrameWindowScoreInput, JevScorer } from "./types.js";
 
@@ -8,6 +9,8 @@ export interface TypeSafeJevScorerOptions {
   model?: string | (() => string);
   apiBaseUrl?: string;
   fetchImpl?: typeof fetch;
+  requestTimeoutMs?: number;
+  retryDelayMs?: number;
 }
 
 interface SystemOneNoulAnswer {
@@ -163,58 +166,60 @@ export function createTypeSafeJevScorer(options: TypeSafeJevScorerOptions): JevS
 
       const requestPayload = buildSystemOneWindowRequest(currentModel, input, encodedFrames);
 
-      let response: Response;
-      try {
-        response = await fetchFn(`${baseUrl}/v1/systemone`, {
-          method: "POST",
-          headers: {
-            Authorization: `Bearer ${currentApiKey}`,
-            "TypeSafe-Danger-Zone-Images": "true",
-            "Content-Type": "application/json"
-          },
-          body: JSON.stringify(requestPayload),
-          signal: input.signal
-        });
-      } catch (err) {
-        if (input.signal.aborted || (err instanceof Error && err.name === "AbortError")) {
-          const abortErr = new Error("Search cancelled");
-          abortErr.name = "AbortError";
-          throw abortErr;
-        }
-        const rawMsg = err instanceof Error ? err.message : "Network request to Jev provider failed";
-        throw new AppError(
-          "JEV_PROVIDER_ERROR",
-          `Failed to reach Jev provider: ${redactSecrets(rawMsg, [currentApiKey])}`,
-          502
-        );
-      }
-
-      if (!response.ok) {
-        let errorDetail = `HTTP ${response.status}`;
+      let body: SystemOneResponseBody | undefined;
+      const payload = JSON.stringify(requestPayload);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        input.signal.throwIfAborted();
+        const timeout = new AbortController();
+        const timer = setTimeout(() => timeout.abort(), options.requestTimeoutMs ?? 45000);
+        const signal = AbortSignal.any([input.signal, timeout.signal]);
+        let retryMs = Math.min(30000, (options.retryDelayMs ?? 1000) * 2 ** attempt);
+        let retryable = true;
         try {
-          const text = await response.text();
-          if (text) {
-            errorDetail = `${errorDetail}: ${text.slice(0, 400)}`;
+          const response = await fetchFn(`${baseUrl}/v1/systemone`, {
+            method: "POST",
+            headers: {
+              Authorization: `Bearer ${currentApiKey}`,
+              "TypeSafe-Danger-Zone-Images": "true",
+              "Content-Type": "application/json"
+            },
+            body: payload,
+            signal
+          });
+          retryable = response.ok || [408, 429, 500, 502, 503, 504].includes(response.status);
+          if (!response.ok) {
+            const retryAfter = response.headers.get("Retry-After");
+            if (retryAfter) {
+              const seconds = Number(retryAfter);
+              const requestedDelay = Number.isFinite(seconds) ? seconds * 1000 : Date.parse(retryAfter) - Date.now();
+              // Never retry earlier than the provider asks. Long waits become an explicit retry.
+              if (requestedDelay > 30000) retryable = false;
+              else if (Number.isFinite(requestedDelay)) retryMs = Math.max(retryMs, requestedDelay);
+            }
+            const detail = (await response.text()).slice(0, 400);
+            const code = [401, 403].includes(response.status) ? "JEV_API_KEY_REJECTED" : response.status === 429 ? "JEV_RATE_LIMITED" : "JEV_PROVIDER_ERROR";
+            throw new AppError(code, `Jev provider request failed (HTTP ${response.status}: ${redactSecrets(detail, [currentApiKey])})`, 502);
           }
-        } catch {
-          // Ignore body read failure
+          // The same deadline covers headers and body consumption.
+          const text = await response.text();
+          try { body = JSON.parse(text) as SystemOneResponseBody; }
+          catch { throw new AppError("JEV_INVALID_RESPONSE", "Jev provider returned non-JSON response.", 502); }
+          break;
+        } catch (error) {
+          input.signal.throwIfAborted();
+          if (error instanceof AppError && error.code === "JEV_INVALID_RESPONSE") retryable = false;
+          if (!retryable || attempt === 2) {
+            if (error instanceof AppError) throw error;
+            throw new AppError(timeout.signal.aborted ? "JEV_TIMEOUT" : "JEV_PROVIDER_ERROR",
+              timeout.signal.aborted ? "Jev took too long to respond. Retry the remaining frames." :
+                `Failed to reach Jev provider: ${redactSecrets(error instanceof Error ? error.message : "Network request failed", [currentApiKey])}`, 502);
+          }
+        } finally {
+          clearTimeout(timer);
         }
-        throw new AppError(
-          "JEV_PROVIDER_ERROR",
-          `Jev provider request failed (${redactSecrets(errorDetail, [currentApiKey])})`,
-          502
-        );
-      }
-
-      let body: SystemOneResponseBody;
-      try {
-        body = (await response.json()) as SystemOneResponseBody;
-      } catch {
-        throw new AppError(
-          "JEV_INVALID_RESPONSE",
-          "Jev provider returned non-JSON response.",
-          502
-        );
+        input.onRetry?.(true);
+        try { await delay(retryMs, undefined, { signal: input.signal }); }
+        finally { input.onRetry?.(false); }
       }
 
       const answers = body?.answers;

@@ -1171,6 +1171,128 @@ child.on("exit", (code) => process.exit(code ?? 1));
     const budgetBody = (await budgetRes.json()) as { error: { code: string } };
     expect(budgetBody.error.code).toBe("FRAME_BUDGET_EXCEEDED");
   });
+  it("opens a movie larger than 2 GiB in place, serves its tail, searches and clips without copying the original", async () => {
+    const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-direct-large-"));
+    tempDirs.push(dataDir);
+    const source = path.join(dataDir, "large original.mp4");
+    await fsp.copyFile(syntheticMoviePath, source);
+    const originalBytes = await fsp.readFile(source);
+    // A valid, sparse MP4 free box crosses the byte boundary without a multi-GB fixture.
+    const handle = await fsp.open(source, "r+");
+    await handle.write(Buffer.from([0, 0, 0, 0, 102, 114, 101, 101]), 0, 8, originalBytes.length);
+    await handle.truncate(2 * 1024 ** 3 + 4096);
+    await handle.close();
+    const before = await fsp.stat(source);
+    const server = await startServer({ port: 0, dataDir: path.join(dataDir, "app"), maxUploadBytes: 1,
+      jevScorer: { async scoreFrameWindow(input) { return Object.fromEntries(input.frames.map(f => [f.id, .9])); } } });
+    activeServers.push(server);
+    const movie = await server.openMovie(source);
+    expect(JSON.stringify(movie)).not.toContain(dataDir);
+    expect(movie.durationSeconds).toBeCloseTo(12);
+    expect(await fsp.readdir(path.join(dataDir, "app/movies", movie.id))).toEqual([]);
+    expect((await fsp.stat(source)).ino).toBe(before.ino);
+    expect((await fsp.stat(source)).size).toBe(before.size);
+    const response = await fetch(`${server.url}${movie.mediaUrl}`, { headers: { Range: `bytes=${before.size - 16}-${before.size - 1}` } });
+    expect(response.status).toBe(206);
+    expect(Buffer.from(await response.arrayBuffer())).toEqual(Buffer.alloc(16));
+    // No HTTP endpoint may turn a supplied path into an opened local file.
+    expect((await fetch(`${server.url}/api/movies/open`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ path: source }) })).status).toBe(404);
+    const started = await fetch(`${server.url}/api/movies/${movie.id}/search`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: "red" }) });
+    const result = await pollSearchUntilTerminal(server.url, (await started.json() as { searchId: string }).searchId);
+    expect(result.status).toBe("completed");
+    expect(result.processed).toBeGreaterThan(0);
+    const clip = await fetch(`${server.url}/api/movies/${movie.id}/clips`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ startSeconds: 2, endSeconds: 5 }) });
+    expect(clip.status).toBe(200);
+    const output = path.join(dataDir, "clip.mp4");
+    await fsp.writeFile(output, Buffer.from(await clip.arrayBuffer()));
+    expect((await probeVideoFile(output)).durationSeconds).toBeCloseTo(3, 1);
+    await server.close(); activeServers.pop();
+    expect((await fsp.stat(source)).size).toBe(before.size);
+  });
+
+  it("prepares a directly opened MKV and preserves originals when preparation is cancelled or fails", async () => {
+    const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-direct-mkv-")); tempDirs.push(dataDir);
+    const original = await fsp.readFile(syntheticMkvPath);
+    const server = await startServer({ port: 0, dataDir: path.join(dataDir, "app") }); activeServers.push(server);
+    const progress: number[] = [];
+    const movie = await server.openMovie(syntheticMkvPath, undefined, value => progress.push(value));
+    expect(movie.durationSeconds).toBeCloseTo(6, 1);
+    const playback = path.join(dataDir, "app/movies", movie.id, "playable.mp4");
+    expect((await probeVideoFile(playback)).videoCodec).toBe("h264");
+    expect(progress.length).toBeGreaterThan(0);
+    expect(await fsp.readFile(syntheticMkvPath)).toEqual(original);
+    const marker = path.join(dataDir, "preparing");
+    const wrapper = path.join(dataDir, "slow.mjs");
+    await fsp.writeFile(wrapper, `import fs from 'node:fs'; fs.writeFileSync(${JSON.stringify(marker)}, 'started'); setTimeout(() => {}, 30000);`);
+    const slow = await startServer({ port: 0, dataDir: path.join(dataDir, "slow"), ffmpegPath: wrapper }); activeServers.push(slow);
+    const abort = new AbortController();
+    const opening = slow.openMovie(syntheticMkvPath, abort.signal).catch(error => error);
+    const deadline = Date.now() + 5000;
+    while (!fs.existsSync(marker) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    expect(fs.existsSync(marker)).toBe(true);
+    abort.abort();
+    expect((await opening).name).toBe("AbortError");
+    expect(await fsp.readdir(path.join(dataDir, "slow/movies"))).toEqual([]);
+    expect(await fsp.readFile(syntheticMkvPath)).toEqual(original);
+    const invalid = path.join(dataDir, "invalid.mp4"); await fsp.writeFile(invalid, "original invalid file");
+    await expect(server.openMovie(invalid)).rejects.toBeDefined();
+    expect(await fsp.readFile(invalid, "utf8")).toBe("original invalid file");
+  });
+
+  it("publishes usable partial results, retains them on failure, and resumes only unfinished windows", async () => {
+    const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-resume-")); tempDirs.push(dataDir);
+    const calls: number[] = []; let fail = true; let release!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const server = await startServer({ port: 0, dataDir, jevScorer: { async scoreFrameWindow(input) {
+      const first = input.frames[0].index; calls.push(first);
+      if (first === 4 && fail) { await held; fail = false; throw new Error("Temporary outage"); }
+      return Object.fromEntries(input.frames.map(f => [f.id, f.index === 2 ? .9 : .1]));
+    } } }); activeServers.push(server);
+    const movie = await server.openMovie(syntheticMoviePath);
+    const started = await fetch(`${server.url}/api/movies/${movie.id}/search`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: "red" }) });
+    const { searchId } = await started.json() as { searchId: string };
+    const deadline = Date.now() + 5000;
+    while (!calls.includes(4) && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    const partial = await (await fetch(`${server.url}/api/searches/${searchId}`)).json() as SearchResponsePayload;
+    expect(partial.status).toBe("searching"); expect(partial.processed).toBe(4); expect(partial.results).toHaveLength(1);
+    expect((await fetch(`${server.url}${partial.results[0].thumbnailUrl}`)).status).toBe(200);
+    release();
+    const failed = await pollSearchUntilTerminal(server.url, searchId);
+    expect(failed.status).toBe("failed"); expect(failed.results).toEqual(partial.results);
+    expect((await fetch(`${server.url}/api/searches/${searchId}/resume`, { method: "POST" })).status).toBe(202);
+    const completed = await pollSearchUntilTerminal(server.url, searchId);
+    expect(completed.status).toBe("completed"); expect(completed.processed).toBe(completed.total);
+    expect(calls.filter(index => index === 0)).toHaveLength(1);
+    expect(calls.filter(index => index === 4)).toHaveLength(2);
+    expect(completed.results).toEqual(partial.results);
+    // A cancellation arriving after completion must preserve the authoritative final snapshot.
+    expect((await fetch(`${server.url}/api/searches/${searchId}`, { method: "DELETE" })).status).toBe(200);
+    expect(await pollSearchUntilTerminal(server.url, searchId)).toEqual(completed);
+    expect((await fetch(`${server.url}/api/searches/${searchId}/resume`, { method: "POST" })).status).toBe(409);
+  });
+
+  it("does not let an old cancelled request overwrite an immediately resumed search", async () => {
+    const dataDir = await fsp.mkdtemp(path.join(os.tmpdir(), "sf-resume-race-")); tempDirs.push(dataDir);
+    let calls = 0; let releaseOld!: () => void;
+    const old = new Promise<void>(resolve => { releaseOld = resolve; });
+    const server = await startServer({ port: 0, dataDir, jevScorer: { async scoreFrameWindow(input) {
+      calls++;
+      if (calls === 1) { await old; input.signal.throwIfAborted(); }
+      return Object.fromEntries(input.frames.map(f => [f.id, .9]));
+    } } }); activeServers.push(server);
+    const movie = await server.openMovie(syntheticMoviePath);
+    const { searchId } = await (await fetch(`${server.url}/api/movies/${movie.id}/search`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ query: "red" }) })).json() as { searchId: string };
+    const deadline = Date.now() + 5000;
+    while (!calls && Date.now() < deadline) await new Promise(resolve => setTimeout(resolve, 20));
+    await fetch(`${server.url}/api/searches/${searchId}`, { method: "DELETE" });
+    await fetch(`${server.url}/api/searches/${searchId}/resume`, { method: "POST" });
+    const completed = await pollSearchUntilTerminal(server.url, searchId);
+    expect(completed.status).toBe("completed");
+    releaseOld();
+    await new Promise(resolve => setTimeout(resolve, 30));
+    expect((await pollSearchUntilTerminal(server.url, searchId)).status).toBe("completed");
+  });
+
 });
 
 

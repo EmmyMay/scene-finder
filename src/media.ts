@@ -104,7 +104,8 @@ export async function checkBinaryAvailable(binary: string): Promise<boolean> {
 function runProcess(
   command: string,
   args: string[],
-  signal?: AbortSignal
+  signal?: AbortSignal,
+  onProgress?: (seconds: number) => void
 ): Promise<{ stdout: string; stderr: string }> {
   return new Promise((resolve, reject) => {
     if (signal?.aborted) {
@@ -130,6 +131,7 @@ function runProcess(
 
     let stdout = "";
     let stderr = "";
+    let progressLine = "";
 
     const onAbort = (): void => {
       killChildProcessTree(child);
@@ -148,6 +150,15 @@ function runProcess(
 
     child.stdout?.on("data", (chunk: string) => {
       stdout += chunk;
+      if (onProgress) {
+        progressLine += chunk;
+        const lines = progressLine.split("\n");
+        progressLine = lines.pop() ?? "";
+        for (const line of lines) {
+          const match = /^out_time_us=(\d+)/.exec(line);
+          if (match) onProgress(Number(match[1]) / 1_000_000);
+        }
+      }
     });
     child.stderr?.on("data", (chunk: string) => {
       stderr += chunk;
@@ -328,6 +339,14 @@ export interface PreparePlayableMovieOptions {
   ffmpegBin?: string;
   ffprobeBin?: string;
   signal?: AbortSignal;
+  onProgress?: (seconds: number) => void;
+}
+
+export function isDirectlyPlayableMovie(sourcePath: string, probed: ProbedVideoInfo): boolean {
+  return [".mp4", ".m4v"].includes(path.extname(sourcePath).toLowerCase()) &&
+    probed.formatName.includes("mp4") && probed.videoCodec === "h264" &&
+    ["yuv420p", "yuvj420p"].includes(probed.pixFmt) &&
+    (!probed.hasAudio || probed.audioCodec === "aac") && probed.videoStreamCount === 1;
 }
 
 /**
@@ -339,22 +358,10 @@ export async function preparePlayableMovie(
 ): Promise<{ playablePath: string; probed: ProbedVideoInfo }> {
   const ffmpegBin = options.ffmpegBin ?? "ffmpeg";
   const ffprobeBin = options.ffprobeBin ?? "ffprobe";
-  const ext = path.extname(options.sourcePath).toLowerCase();
-
-  const isMp4Container =
-    (ext === ".mp4" || ext === ".m4v") && options.probed.formatName.includes("mp4");
   const isCompatibleH264 =
     options.probed.videoCodec === "h264" &&
     (options.probed.pixFmt === "yuv420p" || options.probed.pixFmt === "yuvj420p");
-  const isCompatibleAudio =
-    !options.probed.hasAudio || options.probed.audioCodec === "aac";
-
-  if (
-    isMp4Container &&
-    isCompatibleH264 &&
-    isCompatibleAudio &&
-    options.probed.videoStreamCount === 1
-  ) {
+  if (isDirectlyPlayableMovie(options.sourcePath, options.probed)) {
     return {
       playablePath: options.sourcePath,
       probed: options.probed
@@ -375,6 +382,7 @@ export async function preparePlayableMovie(
           [
             "-hide_banner",
             "-nostdin",
+            "-progress", "pipe:1", "-nostats",
             "-i",
             options.sourcePath,
             "-map",
@@ -389,7 +397,8 @@ export async function preparePlayableMovie(
             options.playableOutputPath,
             "-y"
           ],
-          options.signal
+          options.signal,
+          options.onProgress
         );
 
         const reprobed = await probeVideoFile(
@@ -417,6 +426,7 @@ export async function preparePlayableMovie(
       [
         "-hide_banner",
         "-nostdin",
+        "-progress", "pipe:1", "-nostats",
         "-i",
         options.sourcePath,
         "-map",
@@ -439,7 +449,8 @@ export async function preparePlayableMovie(
         options.playableOutputPath,
         "-y"
       ],
-      options.signal
+      options.signal,
+      options.onProgress
     );
 
     const reprobed = await probeVideoFile(

@@ -6,11 +6,11 @@ Describe a moment in a movie, jump to matching frames, then trim and save an MP4
 
 Download a beta from [GitHub Releases](https://github.com/EmmyMay/scene-finder/releases). On an Apple silicon Mac running macOS 13 or later, open the DMG and drag Scene Finder into Applications. On Windows 10 or 11 x64, run the setup EXE; it installs for your account and creates a Start menu shortcut. Intel Mac builds are not available. Linux x64 remains a portable archive.
 
-**These beta installers are unsigned for public distribution** (ad-hoc signed and not notarized on macOS). Operating-system security prompts are expected. Do not describe them as signed releases.
+The published Mac installer is Developer ID signed and notarized by Apple. Windows installers remain unsigned and may show an unknown-publisher warning.
 
 1. Open **Settings** and connect your Jev API key.
-2. Choose an MKV or MP4 movie. Other FFmpeg-readable formats may also work; incompatible media is prepared for playback locally.
-3. Describe what is visible in the scene, then choose a match to seek there.
+2. Choose or drop an MKV or MP4 movie. The desktop app opens it directly from its current location, including files larger than 2 GiB. Compatible MP4 files need no duplicate; other FFmpeg-readable formats are prepared for playback locally. Keep the original file and any external drive available while using it.
+3. Describe what is visible in the scene. Matching moments appear as the search progresses; you can play and clip them immediately. If a search is interrupted, **Retry remaining frames** (or **Continue searching**) resumes unfinished work while the app stays open.
 4. Set **IN** and **OUT**, preview the range, then export and save the clip.
 
 Movies and exported clips stay on your device. Search sends sampled frames and your query to Jev. Results are approximate sampled matches, not exact scene boundaries or guaranteed detections. V1 searches visible content; it does not search dialogue or audio.
@@ -33,7 +33,7 @@ npm run desktop
 - Windows x64: MSYS2 MINGW64 with GCC, make, pkgconf, nasm, curl, tar and xz. Run media preparation in that shell. The packaged app does not need MSYS2.
 - Linux x64: a C compiler, make, pkg-config, nasm, curl, tar and xz. Omarchy support is best effort; an unlocked Secret Service password store is needed to save a key securely.
 
-The desktop process binds its local service to loopback, authenticates media/API requests with a per-launch token, and keeps the Jev key in OS-encrypted storage. If secure storage is unavailable, a validated key works for the current session with a visible warning; it is never saved unencrypted. Theme preferences survive application restarts. Imported movies are stored under the operating system's Scene Finder application-data folder.
+The desktop process binds its local service to loopback, authenticates media/API requests with a per-launch token, and keeps the Jev key in OS-encrypted storage. If secure storage is unavailable, a validated key works for the current session with a visible warning; it is never saved unencrypted. Theme preferences survive application restarts. Original movies stay where you selected them. Generated playback copies, sampled frames, and temporary clips are stored under the operating system's Scene Finder application-data folder.
 
 ## Validate and package
 
@@ -78,11 +78,13 @@ Provide signing access through the OS keychain, provider console, or encrypted C
 
 ## Download website
 
-The buildless landing page lives in `website/` and is hosted at [scene-finder.emmyleke.chatgpt.site](https://scene-finder.emmyleke.chatgpt.site/). Preview it with `python3 -m http.server 4175 --bind 127.0.0.1 --directory website`. It contains only public marketing assets and links to versioned GitHub downloads; it does not collect API keys or accept movie uploads.
+The buildless landing page lives in `website/` and is hosted at [scene-finder.emmyleke.chatgpt.site](https://scene-finder.emmyleke.chatgpt.site/). Preview it with `python3 -m http.server 4175 --bind 127.0.0.1 --directory website`. It contains only public marketing assets and links to versioned Cloudflare R2 downloads; it does not collect API keys or accept movie uploads.
 
 For Sites publication, copy the website's HTML, CSS, JS and `assets/` into the deployment checkout's `dist/`, and copy `website/.openai/hosting.json` to its `.openai/hosting.json`. Use the Sites source workflow to commit, push, package, save and deploy that exact snapshot. The local deployment checkout is `.data/landing-site` and remains excluded from the application package and this repository. On a new release, verify the actual release assets before updating the website's versioned links.
 
-The movie upload limit defaults to 2 GiB and can be changed with `MAX_UPLOAD_BYTES`. A search is limited to 4,000 sampled frames (`MAX_SAMPLED_FRAMES`); at the default two-second interval, this covers about 133 minutes. Imported movies and temporary search files are local application data; V1 does not provide a library-management interface.
+The browser development upload route remains limited to 2 GiB by default (`MAX_UPLOAD_BYTES`); desktop direct opening does not use that upload route. A search is limited to 4,000 sampled frames (`MAX_SAMPLED_FRAMES`); at the default two-second interval, this covers about 133 minutes. File size and movie duration are separate limits. V1 does not provide a persistent movie library or resume searches after restarting the app.
+
+Jev requests have a 45-second deadline and at most three attempts for temporary network errors, timeouts, and retryable HTTP responses. Short provider retry delays are respected; longer delays leave a manual retry action. Invalid keys and malformed responses are not automatically retried. Completed frame batches are retained for resuming the current search. A retry can repeat a provider request whose response was lost and may incur additional Jev usage.
 
 ## Media components
 
