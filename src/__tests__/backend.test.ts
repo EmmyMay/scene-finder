@@ -1265,6 +1265,9 @@ child.on("exit", (code) => process.exit(code ?? 1));
     expect(calls.filter(index => index === 0)).toHaveLength(1);
     expect(calls.filter(index => index === 4)).toHaveLength(2);
     expect(completed.results).toEqual(partial.results);
+    // A cancellation arriving after completion must preserve the authoritative final snapshot.
+    expect((await fetch(`${server.url}/api/searches/${searchId}`, { method: "DELETE" })).status).toBe(200);
+    expect(await pollSearchUntilTerminal(server.url, searchId)).toEqual(completed);
     expect((await fetch(`${server.url}/api/searches/${searchId}/resume`, { method: "POST" })).status).toBe(409);
   });
 

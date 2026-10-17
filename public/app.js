@@ -505,9 +505,10 @@ async function cancelSearch(run = state.run) {
   try {
     await deleteSearch(run);
     if (!isCurrent(run)) return;
-    state.resume = run;
-    ui["resume-search"].textContent = "Continue searching";
-    finishSearch(run, "Search stopped. Your matching moments are kept.");
+    // Completion may beat cancellation. Read the final snapshot before offering resume.
+    run.cancelRequested = false;
+    ui["cancel-search"].disabled = false;
+    await pollSearch(run);
   } catch {
     if (!isCurrent(run)) return;
     run.cancelRequested = false;
@@ -826,7 +827,7 @@ async function pollSearch(run) {
     if (results.length) resultStatus(`${results.length} matching ${results.length === 1 ? "moment" : "moments"} so far. You can play or clip one while the search continues.`);
     const total = Number(search.total);
     const processed = Math.max(0, Number(search.processed) || 0);
-    if (search.status === "searching" && Number.isFinite(total) && total > 0) {
+    if (Number.isFinite(total) && total > 0 && (search.status === "searching" || processed > 0)) {
       ui["search-progress"].max = total;
       ui["search-progress"].value = Math.min(processed, total);
       ui["search-count"].textContent = `${Math.min(processed, total)} of ${total} frames checked`;
