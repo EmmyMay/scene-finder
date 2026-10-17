@@ -32,7 +32,7 @@ it("retries transient responses with the same payload and reports recovery", asy
 it.each([401, 403, 400, 422, 429])("does not blindly retry rejected requests or a long Retry-After (%s)", async status => {
   let calls = 0;
   const scorer = createTypeSafeJevScorer({ apiKey: "test-secret", retryDelayMs: 0, fetchImpl: async () => {
-    calls++; return new Response("test-secret", { status, headers: { "Retry-After": "120" } });
+    calls++; return new Response("test-secret", { status, headers: status === 429 ? { "Retry-After": "120" } : {} });
   } });
   const error = await scorer.scoreFrameWindow(input).catch(error => error);
   expect(error.message).not.toContain("test-secret"); expect(calls).toBe(1);
